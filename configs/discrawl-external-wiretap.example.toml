@@ -1,0 +1,20 @@
+# Copy this template to configs/discrawl-external-wiretap.local.toml and chmod 600.
+# Never commit local guild IDs or SQLite databases.
+
+db_path = ".state/discrawl-external.db"
+default_guild_id = "REPLACE_EXTERNAL_GUILD_ID"
+guild_ids = ["REPLACE_EXTERNAL_GUILD_ID"]
+
+[sync]
+source = "wiretap"
+attachment_text = false
+attachment_media = false
+
+[share]
+auto_update = false
+
+[search]
+lexical = "fts5"
+
+[search.embeddings]
+enabled = false

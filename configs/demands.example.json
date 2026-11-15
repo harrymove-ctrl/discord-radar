@@ -1,0 +1,74 @@
+[
+  {
+    "id": "ai-video-and-remotion",
+    "label": "AI Video Maker & Remotion Workflows",
+    "keywords": [
+      "remotion",
+      "video",
+      "render",
+      "ffmpeg",
+      "caption",
+      "storyboard",
+      "audio"
+    ],
+    "ownedTargetChannel": "#video-tips",
+    "captureSources": [
+      {
+        "tier": "desktop_wiretap",
+        "guildId": "REPLACE_EXTERNAL_GUILD_ID",
+        "channelId": "REPLACE_EXTERNAL_CHANNEL_ID",
+        "channelName": "remotion-help"
+      },
+      {
+        "tier": "browser_snapshot",
+        "guildId": "REPLACE_EXTERNAL_GUILD_ID_2",
+        "channelId": "REPLACE_EXTERNAL_CHANNEL_ID_2",
+        "channelName": "video-generation"
+      }
+    ]
+  },
+  {
+    "id": "coding-agents-and-mcp",
+    "label": "AI Coding Agents & MCP Tooling",
+    "keywords": [
+      "mcp",
+      "kiro",
+      "claude",
+      "cursor",
+      "hook",
+      "sqlite",
+      "timeout"
+    ],
+    "ownedTargetChannel": "#agent-patterns",
+    "captureSources": [
+      {
+        "tier": "desktop_wiretap",
+        "guildId": "REPLACE_EXTERNAL_GUILD_ID_3",
+        "channelId": "REPLACE_EXTERNAL_CHANNEL_ID_3",
+        "channelName": "mcp-servers"
+      }
+    ]
+  },
+  {
+    "id": "community-growth-ops",
+    "label": "Developer Community Growth & Support Operations",
+    "keywords": [
+      "onboarding",
+      "pricing",
+      "docs",
+      "bug",
+      "migration",
+      "webhook",
+      "rate limit"
+    ],
+    "ownedTargetChannel": "#community-playbooks",
+    "captureSources": [
+      {
+        "tier": "bot_api",
+        "guildId": "REPLACE_YOUR_OWNED_GUILD_ID",
+        "channelId": "REPLACE_YOUR_OWNED_HELP_CHANNEL_ID",
+        "channelName": "community-help"
+      }
+    ]
+  }
+]

@@ -1,0 +1,39 @@
+{
+  "name": "discord-radar",
+  "version": "0.1.0",
+  "description": "Local Discord channel archiver, SQLite FTS5 search CLI, topic signal extractor, and multilingual anti slop draft builder",
+  "type": "module",
+  "license": "MIT",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./cli": "./src/cli.ts"
+  },
+  "bin": {
+    "discord-radar": "./src/cli.ts"
+  },
+  "scripts": {
+    "doctor": "bun run src/cli.ts doctor",
+    "targets": "bun run src/cli.ts targets",
+    "ingest:snapshot": "bun run src/cli.ts ingest-snapshot",
+    "ingest:jsonl": "bun run src/cli.ts ingest-jsonl",
+    "today": "bun run src/cli.ts today",
+    "search": "bun run src/cli.ts search",
+    "signals": "bun run src/cli.ts signals",
+    "brief": "bun run src/cli.ts brief",
+    "digest": "bun run src/cli.ts digest",
+    "schedule": "bun run src/cli.ts schedule",
+    "schedule:install": "bun run src/cli.ts schedule --install-cron",
+    "schedule:uninstall": "bun run src/cli.ts schedule --uninstall-cron",
+    "translate": "bun run src/cli.ts translate",
+    "voice:check": "bun run src/cli.ts voice-check",
+    "sync:epics": "node scripts/sync-github-epics.mjs",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.2",
+    "typescript": "^5.8.3"
+  }
+}

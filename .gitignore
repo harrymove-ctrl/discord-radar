@@ -1,0 +1,16 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.state/
+.cache/
+vault/
+captures/
+configs/*.local.json
+configs/*.local.toml
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+*.log
+.DS_Store

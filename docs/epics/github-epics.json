@@ -1,0 +1,309 @@
+{
+  "defaultRepo": "",
+  "labels": [
+    { "name": "epic", "color": "5319E7", "description": "Top level product initiative" },
+    { "name": "security", "color": "B60205", "description": "Credential safety, DM quarantine, or SSRF protection" },
+    { "name": "crawler", "color": "0E8A16", "description": "Owned Bot sync, passive wiretap cache, or browser snapshot ingest" },
+    { "name": "vault", "color": "1D76DB", "description": "Local bun:sqlite WAL FTS5 indexing and deduplication" },
+    { "name": "signals", "color": "006B75", "description": "Demand profiles, external anonymization, and signal ranking" },
+    { "name": "voice-gate", "color": "FBCA04", "description": "Owner style matching, anti slop gate, translation layer, and content brief generation" },
+    { "name": "mcp", "color": "7057FF", "description": "Local stdio MCP server tools for coding agents" },
+    { "name": "automation", "color": "C2E0C6", "description": "Daily digest scheduling and approved Bot posting" }
+  ],
+  "milestones": [
+    {
+      "id": "M1",
+      "title": "M1: Local Vault & Safe Crawlers",
+      "dueOn": "2026-11-22T23:59:59Z",
+      "description": "SQLite WAL FTS5 vault, @me DM quarantine, Discord CDN allowlist, passive wiretap script, and Chrome/OpenCLI snapshot importer."
+    },
+    {
+      "id": "M2",
+      "title": "M2: Demand Profiles, Translation & VoiceGate Briefs",
+      "dueOn": "2026-11-29T23:59:59Z",
+      "description": "Custom demand profiles, anonymized signal ranking, owner voice indexing, Google Translate + de-slop cleanup, and strict voiceGate draft brief generation."
+    },
+    {
+      "id": "M3",
+      "title": "M3: Daily Digest, MCP & Approved Bot Publisher",
+      "dueOn": "2026-12-06T23:59:59Z",
+      "description": "Local stdio MCP server for coding agents, scheduled morning demand digests, and dry run by default owned channel Bot publishing."
+    }
+  ],
+  "epics": [
+    {
+      "id": "EPIC-01",
+      "title": "Core Vault, Privacy Quarantine & Security Boundaries",
+      "milestone": "M1",
+      "labels": ["security", "vault"],
+      "summary": "Harden local SQLite storage permissions, isolate @me direct messages, enforce HTTPS Discord CDN attachment allowlists, and prevent user token handling.",
+      "prds": ["docs/requirements/README.md"],
+      "issues": [
+        {
+          "id": "RAD-01",
+          "title": "Harden bun:sqlite WAL and FTS5 schema with 0600 file permissions",
+          "phase": "M1",
+          "labels": ["vault", "security"],
+          "problem": "Local message archives must support sub 15 ms full text search without exposing readable database files on disk.",
+          "desiredBehavior": "RadarVault creates parent directories with 0700 mode, sets 0600 on the SQLite file, enables WAL mode, and syncs FTS5 triggers cleanly.",
+          "entryPoints": ["src/vault.ts"],
+          "acceptanceCriteria": [
+            "Initialize messages and messages_fts tables idempotently.",
+            "Sanitize user search tokens before building FTS5 MATCH clauses."
+          ],
+          "verification": "bun test passes FTS5 search assertions cleanly."
+        },
+        {
+          "id": "RAD-02",
+          "title": "Enforce @me DM quarantine and credential secret redaction",
+          "phase": "M1",
+          "labels": ["security"],
+          "problem": "Local Discord desktop caches store private direct messages alongside guild discussions and secrets can leak into error output.",
+          "desiredBehavior": "All @me, dm, and direct_message inputs are skipped before SQLite insertion, filtered from all SELECT queries, and tokens are scrubbed from errors.",
+          "entryPoints": ["src/security.ts", "src/vault.ts"],
+          "acceptanceCriteria": [
+            "Reject mfa user session tokens in assertSafeBotToken.",
+            "Guarantee zero @me rows appear in search, recent, or stats results."
+          ],
+          "verification": "bun test verifies zero @me leak across mixed payloads."
+        },
+        {
+          "id": "RAD-03",
+          "title": "Enforce strict HTTPS port 443 Discord CDN attachment allowlist",
+          "phase": "M1",
+          "labels": ["security"],
+          "problem": "Unvalidated attachment URLs from external chat caches pose SSRF and credential leak risks.",
+          "desiredBehavior": "Only HTTPS URLs on default port 443 targeting cdn.discordapp.com, media.discordapp.net, or images-ext-<digits>.discordapp.net are retained.",
+          "entryPoints": ["src/security.ts", "src/vault.ts"],
+          "acceptanceCriteria": [
+            "Reject HTTP, localhost, IPv4/IPv6 literals, non 443 ports, and embedded credentials.",
+            "Return rejectedAttachmentCount inside IngestSummary."
+          ],
+          "verification": "bun test asserts 100% rejection across invalid CDN test vectors."
+        }
+      ]
+    },
+    {
+      "id": "EPIC-02",
+      "title": "Tier 1, Tier 2 & Tier 3 Multi Source Ingestion",
+      "milestone": "M1",
+      "labels": ["crawler", "vault"],
+      "summary": "Collect messages safely across owned servers via official Bot API, external servers via zero network wiretap caches, and web channels via OpenCLI/Chrome snapshots.",
+      "prds": ["docs/requirements/README.md"],
+      "issues": [
+        {
+          "id": "RAD-04",
+          "title": "Add official Bot REST collector for owned Discord channels",
+          "phase": "M1",
+          "labels": ["crawler"],
+          "problem": "Syncing your own Discord channels directly inside discord-radar avoids manual JSON exports when building owner voice profiles and owned metrics.",
+          "desiredBehavior": "Pull messages from owned channel IDs using DISCORD_BOT_TOKEN with Bot prefix validation, pagination cursor tracking, and HTTP 429 Retry-After backoff.",
+          "entryPoints": ["src/bot_sync.ts", "src/cli.ts"],
+          "acceptanceCriteria": [
+            "Support --guild and --channel scoped incremental pulls.",
+            "Fail safely with redacted diagnostics when Bot permissions are missing."
+          ],
+          "verification": "Mock Discord REST tests validate incremental pagination and 429 pacing."
+        },
+        {
+          "id": "RAD-05",
+          "title": "Harden passive discrawl wiretap local cache wrapper",
+          "phase": "M1",
+          "labels": ["crawler", "security"],
+          "problem": "Daily non owned Discord extraction should require one safe command rather than chaining long shell flags manually.",
+          "desiredBehavior": "scripts/crawl-wiretap.sh runs discrawl wiretap offline with DISCRAWL_NO_UPDATE_CHECK=1 and imports non DM rows into SQLite.",
+          "entryPoints": ["scripts/crawl-wiretap.sh", "configs/discrawl-external-wiretap.example.toml"],
+          "acceptanceCriteria": [
+            "Enforce umask 077 and chmod 600 on wiretap TOML configs.",
+            "Filter guild_id != '@me' before piping JSONL into ingest-jsonl."
+          ],
+          "verification": "Shell check and dry JSONL fixture ingest succeed cleanly."
+        },
+        {
+          "id": "RAD-06",
+          "title": "Support OpenCLI accessibility trees and Chrome DevTools snapshots",
+          "phase": "M1",
+          "labels": ["crawler"],
+          "problem": "Older web discussions scrolled inside Chrome are cleaner via DOM accessibility trees than Chromium disk cache fragments.",
+          "desiredBehavior": "parseBrowserSnapshot accepts JSON arrays, OpenCLI accessibility trees, and plain timestamped chat transcripts cleanly.",
+          "entryPoints": ["src/snapshot.ts", "src/cli.ts"],
+          "acceptanceCriteria": [
+            "Ignore cookies, tokens, and storage keys when parsing snapshot JSON.",
+            "Emit normalized records tagged with sourceTier = browser_snapshot."
+          ],
+          "verification": "Unit tests validate all three snapshot input shapes."
+        },
+        {
+          "id": "RAD-07",
+          "title": "Guarantee cross tier deduplication and deterministic anonymization",
+          "phase": "M1",
+          "labels": ["vault", "signals"],
+          "problem": "Moving from wiretap capture to Chrome snapshots or later adding a Bot must not duplicate records or leak external handles.",
+          "desiredBehavior": "Compute deterministic dedup keys and map external speakers to Participant_N while scrubbing handles, IDs, emails, and invites.",
+          "entryPoints": ["src/vault.ts", "src/security.ts"],
+          "acceptanceCriteria": [
+            "Deduplicate identical messageId entries across wiretap and browser_snapshot tiers.",
+            "Strip @mentions, email addresses, and raw snowflakes from non Bot inputs."
+          ],
+          "verification": "Cross tier duplicate test confirms skippedDuplicates increments cleanly."
+        }
+      ]
+    },
+    {
+      "id": "EPIC-03",
+      "title": "Demand Profiles & Anonymized Signal Radar",
+      "milestone": "M2",
+      "labels": ["signals"],
+      "summary": "Weight and rank captured community chatter against configurable user demand profiles without committing guild or channel IDs.",
+      "prds": ["docs/requirements/README.md"],
+      "issues": [
+        {
+          "id": "RAD-08",
+          "title": "Support local untracked configs/demands.local.json profiles",
+          "phase": "M2",
+          "labels": ["signals", "security"],
+          "problem": "Target crawl keywords and guild IDs vary per deployment and must stay out of git commits.",
+          "desiredBehavior": "CLI commands resolve configs/demands.local.json automatically when present while shipping sanitized configs/demands.example.json in Git.",
+          "entryPoints": ["configs/demands.example.json", "src/cli.ts"],
+          "acceptanceCriteria": [
+            "Ignore configs/*.local.json inside .gitignore.",
+            "Allow selecting active profile via --demand <id> or inline --keywords."
+          ],
+          "verification": "bun run targets --json returns loaded demand profiles cleanly."
+        },
+        {
+          "id": "RAD-10",
+          "title": "Add structured analytics subcommands (stats, top, export)",
+          "phase": "M2",
+          "labels": ["signals", "vault"],
+          "problem": "Reviewing high volume capture channels needs compact rollups before generating weekly content plans.",
+          "desiredBehavior": "Implement stats, top channels/topics, and anonymized JSON/Markdown exports matching { ok, schema_version, data }.",
+          "entryPoints": ["src/cli.ts", "src/vault.ts"],
+          "acceptanceCriteria": [
+            "All subcommands emit deterministic JSON in non TTY mode.",
+            "Never expose @me DMs or un anonymized external handles in exports."
+          ],
+          "verification": "CLI contract tests verify valid JSON parsing on every subcommand."
+        },
+        {
+          "id": "RAD-09",
+          "title": "Refine signal clustering weights across bugs, questions, features, and comparisons",
+          "phase": "M2",
+          "labels": ["signals"],
+          "problem": "Keyword hits alone miss recency and multi channel signal repetition across communities.",
+          "desiredBehavior": "Score signal clusters by intent severity, matched demand keywords, message count, and time decay inside src/signals.ts.",
+          "entryPoints": ["src/signals.ts"],
+          "acceptanceCriteria": [
+            "Cluster related discussions under normalized topic keys and category labels.",
+            "Include matchedKeywords, channelNames, and scrubbed sampleSnippets."
+          ],
+          "verification": "bun test asserts demand keyword boost elevates matching clusters to rank 1."
+        }
+      ]
+    },
+    {
+      "id": "EPIC-04",
+      "title": "VoiceGate, Google Translate & Content Brief Synthesis",
+      "milestone": "M2",
+      "labels": ["voice-gate"],
+      "summary": "Keep drafted tutorials and Discord replies authentic to your own voice with strict anti slop gates and token safe Google Translate localization.",
+      "prds": ["docs/requirements/README.md"],
+      "issues": [
+        {
+          "id": "RAD-11",
+          "title": "Build owner style indexer from owned channel history",
+          "phase": "M2",
+          "labels": ["voice-gate"],
+          "problem": "Generated content briefs sound generic unless anchored to the author's actual tone in owned Discord servers.",
+          "desiredBehavior": "Analyze only RADAR_OWNER_AUTHOR_ID messages recorded under sourceTier = bot_api to summarize sentence length, greeting style, and code block habits.",
+          "entryPoints": ["src/voice_profile.ts", "src/cli.ts"],
+          "acceptanceCriteria": [
+            "Strictly exclude external wiretap/browser messages when indexing owner voice.",
+            "Persist reusable JSON voice profile in .state/voice-profile.json."
+          ],
+          "verification": "Unit test builds deterministic owner style stats from owned fixture messages."
+        },
+        {
+          "id": "RAD-12",
+          "title": "Enforce AI slop phrase, dash punctuation, and overlap gates with de-slop cleanup",
+          "phase": "M2",
+          "labels": ["voice-gate", "security"],
+          "problem": "Generated outlines or drafts must never ship with AI cliché phrasing, dash slop, invisible watermark characters, or verbatim copied member text.",
+          "desiredBehavior": "checkVoiceGate rejects AI slop phrases, zero width Unicode, em/en dashes, spaced hyphens, HTML tags, and > 12 consecutive overlapping words while stripContentSlop cleans drafts.",
+          "entryPoints": ["src/security.ts", "src/translate.ts"],
+          "acceptanceCriteria": [
+            "Detect and strip common AI filler phrases and dash punctuation cleanly.",
+            "Provide standalone voice-check CLI command for manual drafts."
+          ],
+          "verification": "bun test passes positive and negative voiceGate plus stripContentSlop assertions."
+        },
+        {
+          "id": "RAD-13",
+          "title": "Generate multilingual Markdown briefs using Google Translate and token masking",
+          "phase": "M2",
+          "labels": ["voice-gate", "signals"],
+          "problem": "Operators need localized or pivot de-slopped content briefs without corrupting CLI commands, URLs, or Discord #channel names.",
+          "desiredBehavior": "translateText and translateContentBrief support google_gtx and GOOGLE_TRANSLATE_API_KEY v2 with --lang and --pivot flags while preserving protected tokens verbatim.",
+          "entryPoints": ["src/translate.ts", "src/signals.ts", "src/cli.ts"],
+          "acceptanceCriteria": [
+            "Preserve inline code, fenced code blocks, URLs, and #channel mentions across translation hops.",
+            "Support bun run translate and bun run brief --lang <code> [--pivot <code>]."
+          ],
+          "verification": "bun test passes single hop, Cloud v2, pivot round trip, and brief translation checks."
+        }
+      ]
+    },
+    {
+      "id": "EPIC-05",
+      "title": "Daily Digest, MCP Server & Approved Bot Publisher",
+      "milestone": "M3",
+      "labels": ["mcp", "automation"],
+      "summary": "Integrate discord-radar into coding agents via stdio MCP, daily morning briefs, and dry run by default Bot posting.",
+      "prds": ["docs/requirements/README.md"],
+      "issues": [
+        {
+          "id": "RAD-14",
+          "title": "Implement discord-radar-mcp stdio server for coding agents",
+          "phase": "M3",
+          "labels": ["mcp"],
+          "problem": "Querying your signal vault inside Kiro, Claude Code, or Cursor should happen through direct MCP tool calls rather than manual shell steps.",
+          "desiredBehavior": "Expose stdio MCP tools for search_radar, list_demands, get_top_signals, generate_brief, translate_text, and check_voice_gate over stdin/stdout JSON-RPC.",
+          "entryPoints": ["src/mcp.ts"],
+          "acceptanceCriteria": [
+            "Keep stdout strictly JSON-RPC and route diagnostics to stderr.",
+            "Guarantee zero write side effects across read and synthesis MCP tools."
+          ],
+          "verification": "Automated stdio handshake and tool call test passes locally."
+        },
+        {
+          "id": "RAD-15",
+          "title": "Add daily content trace digest and randomized 08:00 to 18:00 window scheduler",
+          "phase": "M3",
+          "labels": ["automation", "signals"],
+          "problem": "Daily tracking needs delta comparisons across days without executing at an identical predictable clock minute every morning.",
+          "desiredBehavior": "Add digest and schedule commands compiling .state/inbox/ plus passive wiretaps into .state/digests/YYYY-MM-DD.{md,json} with topic deltas (new, rising, steady, cooling) triggered once per calendar day at a randomized minute between 08:00 and 18:00 local time.",
+          "entryPoints": ["src/digest.ts", "src/schedule.ts", "src/cli.ts"],
+          "acceptanceCriteria": [
+            "Trace day over day post count deltas and render voiceGate checked Markdown and JSON reports.",
+            "Enforce strict window boundaries (08:00 to 18:00), pick one independent random minute per calendar day, and support non destructive crontab install."
+          ],
+          "verification": "Integration tests verify inbox archiving, new/rising cluster deltas, 100 random draws inside 08:00 to 18:00, and single execution per day."
+        },
+        {
+          "id": "RAD-16",
+          "title": "Add dry run first official Bot publisher with explicit approval gate",
+          "phase": "M3",
+          "labels": ["automation", "security", "voice-gate"],
+          "problem": "Publishing approved briefs into your own Discord channel must never fire accidentally or bypass voiceGate.",
+          "desiredBehavior": "Default publish commands to preview only and require --live --approvedBy <operator> plus passing voiceGate to send via Bot REST.",
+          "entryPoints": ["src/publisher.ts", "src/cli.ts"],
+          "acceptanceCriteria": [
+            "Enforce 5s cooldown and stop immediately on HTTP 429 or 403.",
+            "Log published message IDs and approvedBy attribution locally."
+          ],
+          "verification": "Mock REST test confirms dry run default and flag enforcement."
+        }
+      ]
+    }
+  ]
+}
