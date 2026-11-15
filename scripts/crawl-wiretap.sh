@@ -12,7 +12,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 CONFIG_PATH="${1:-${DISCRAWL_CONFIG:-configs/discrawl-external-wiretap.local.toml}}"
-GUILD_ID="${2:-${TARGET_EXTERNAL_GUILD_ID:-}}"
+WIRETAP_FLAG="${2:-}"
 DISCRAWL_EXEC="${DISCRAWL_BIN:-discrawl}"
 
 if [[ ! -x "$DISCRAWL_EXEC" ]]; then
@@ -33,13 +33,13 @@ mkdir -p .state
 chmod 700 .state
 chmod 600 "$CONFIG_PATH"
 
-if [[ -n "$GUILD_ID" ]]; then
-  "$DISCRAWL_EXEC" --config "$CONFIG_PATH" wiretap --guild "$GUILD_ID"
+if [[ "$WIRETAP_FLAG" == "--full-cache" ]]; then
+  "$DISCRAWL_EXEC" --config "$CONFIG_PATH" wiretap --full-cache
 else
   "$DISCRAWL_EXEC" --config "$CONFIG_PATH" wiretap
 fi
 
-SQL_QUERY="SELECT message_id, guild_id, channel_id, author_id, author_name, content, sent_at FROM messages WHERE lower(guild_id) != '@me' ORDER BY sent_at DESC LIMIT 500"
+SQL_QUERY="SELECT m.id AS message_id, m.guild_id, m.channel_id, COALESCE(c.name, m.channel_id) AS channel_name, m.author_id, m.content, m.created_at FROM messages m LEFT JOIN channels c ON c.id = m.channel_id WHERE lower(m.guild_id) != '@me' ORDER BY m.created_at DESC LIMIT 500"
 
 "$DISCRAWL_EXEC" --config "$CONFIG_PATH" sql "$SQL_QUERY" --jsonl | \
   bun run src/cli.ts ingest-jsonl --tier desktop_wiretap --db "${RADAR_DB_PATH:-.state/radar.db}" --json

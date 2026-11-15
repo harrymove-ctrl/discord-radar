@@ -1,10 +1,17 @@
 #!/usr/bin/env bun
 import fs from "node:fs";
-import { assertSafeBotToken, checkVoiceGate, redactSecrets } from "./security.ts";
 import {
+  assertSafeBotToken,
+  checkVoiceGate,
+  parseDiscordChannelUrl,
+  redactSecrets,
+} from "./security.ts";
+import {
+  exportDemoPack,
   loadDemandProfiles,
   parseJsonlMessages,
   runDailyDigest,
+  upsertLocalCaptureSources,
 } from "./digest.ts";
 import {
   ensureDailyScheduleState,
@@ -27,14 +34,18 @@ interface CliOptions {
   guildId: string;
   channelId: string;
   channelName: string;
+  urls: string[];
+  label: string;
   tier: SourceTier;
   file: string;
   hours: number;
+  hasExplicitHours: boolean;
   limit: number;
   keywords: string[];
   demandId: string;
   demandsFile: string;
   targetChannel: string;
+  hasExplicitTargetChannel: boolean;
   draft: string;
   text: string;
   lang: string;
@@ -64,14 +75,18 @@ function parseFlags(argv: string[]): { command: string; opts: CliOptions } {
     guildId: "",
     channelId: "",
     channelName: "",
+    urls: [],
+    label: "",
     tier: "desktop_wiretap",
     file: "",
     hours: 24,
+    hasExplicitHours: false,
     limit: 50,
     keywords: [],
     demandId: "",
     demandsFile: "",
     targetChannel: "#engineering-notes",
+    hasExplicitTargetChannel: false,
     draft: "",
     text: "",
     lang: process.env.RADAR_TARGET_LANG?.trim() || "",
@@ -112,12 +127,20 @@ function parseFlags(argv: string[]): { command: string; opts: CliOptions } {
       opts.channelId = argv[++i]!;
     } else if (arg === "--channel-name" && argv[i + 1]) {
       opts.channelName = argv[++i]!;
+    } else if (arg === "--url" && argv[i + 1]) {
+      for (const rawUrl of argv[++i]!.split(",")) {
+        const cleaned = rawUrl.trim();
+        if (cleaned) opts.urls.push(cleaned);
+      }
+    } else if (arg === "--label" && argv[i + 1]) {
+      opts.label = argv[++i]!;
     } else if (arg === "--tier" && argv[i + 1]) {
       opts.tier = argv[++i]! as SourceTier;
     } else if (arg === "--file" && argv[i + 1]) {
       opts.file = argv[++i]!;
     } else if (arg === "--hours" && argv[i + 1]) {
       opts.hours = Number.parseInt(argv[++i]!, 10) || 24;
+      opts.hasExplicitHours = true;
     } else if (arg === "--limit" && argv[i + 1]) {
       opts.limit = Number.parseInt(argv[++i]!, 10) || 50;
     } else if (arg === "--keywords" && argv[i + 1]) {
@@ -131,6 +154,7 @@ function parseFlags(argv: string[]): { command: string; opts: CliOptions } {
       opts.demandsFile = argv[++i]!;
     } else if (arg === "--target-channel" && argv[i + 1]) {
       opts.targetChannel = argv[++i]!;
+      opts.hasExplicitTargetChannel = true;
     } else if (arg === "--draft" && argv[i + 1]) {
       opts.draft = argv[++i]!;
     } else if (arg === "--text" && argv[i + 1]) {
@@ -178,6 +202,61 @@ async function run(): Promise<void> {
   let vault: RadarVault | null = null;
 
   try {
+    if (opts.urls.length > 0 && command !== "add-source" && command !== "demo-pack") {
+      const parsedFirst = parseDiscordChannelUrl(opts.urls[0]!);
+      if (!opts.guildId) opts.guildId = parsedFirst.guildId;
+      if (!opts.channelId) opts.channelId = parsedFirst.channelId;
+    }
+
+    if (command === "add-source") {
+      if (opts.urls.length === 0) {
+        emit(opts, {
+          ok: false,
+          schema_version: "1",
+          error: {
+            code: "missing_arguments",
+            message:
+              "add-source requires at least one --url https://discord.com/channels/<guildId>/<channelId>.",
+          },
+        });
+        process.exitCode = 1;
+        return;
+      }
+      const res = upsertLocalCaptureSources({
+        demandsFile: opts.demandsFile || undefined,
+        demandId: opts.demandId || "hackathon-demo-insights",
+        label: opts.label || undefined,
+        urls: opts.urls,
+        keywords: opts.keywords,
+        ownedTargetChannel: opts.hasExplicitTargetChannel ? opts.targetChannel : undefined,
+        channelNames: opts.channelName
+          ? opts.channelName.split(",").map((s) => s.trim()).filter(Boolean)
+          : undefined,
+        tier: opts.tier,
+      });
+      emit(opts, { ok: true, schema_version: "1", data: res });
+      return;
+    }
+
+    if (command === "demo-pack") {
+      const pack = await exportDemoPack({
+        dbPath: opts.dbPath,
+        demandsFile: opts.demandsFile,
+        outDir: opts.outDir || undefined,
+        demandId: opts.demandId || undefined,
+        urls: opts.urls.length > 0 ? opts.urls : undefined,
+        guildId: opts.urls.length === 0 ? opts.guildId || undefined : undefined,
+        channelIds: opts.urls.length === 0 && opts.channelId ? [opts.channelId] : undefined,
+        keywords: opts.keywords.length > 0 ? opts.keywords : undefined,
+        hours: opts.hasExplicitHours ? opts.hours : undefined,
+        lang: opts.lang || undefined,
+        fromLang: opts.fromLang,
+        pivotLang: opts.pivotLang || undefined,
+      });
+      emit(opts, { ok: true, schema_version: "1", data: pack });
+      return;
+    }
+
     if (command === "doctor") {
       const botToken = process.env.DISCORD_BOT_TOKEN?.trim() || "";
       let botTokenValid = "not_configured";
@@ -475,7 +554,7 @@ async function run(): Promise<void> {
       error: {
         code: "unknown_command",
         message: `Unknown command "${command}".`,
-        hint: "Use doctor, targets, ingest-snapshot, ingest-jsonl, today, search, signals, brief, digest, schedule, translate, or voice-check.",
+        hint: "Use doctor, targets, add-source, ingest-snapshot, ingest-jsonl, today, search, signals, brief, demo-pack, digest, schedule, translate, or voice-check.",
       },
     });
     process.exitCode = 1;

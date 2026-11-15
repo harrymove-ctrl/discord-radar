@@ -1,4 +1,4 @@
-import type { VoiceGateResult } from "./types.ts";
+import type { ParsedDiscordChannelUrl, VoiceGateResult } from "./types.ts";
 
 const ALLOWED_CDN_HOSTS = new Set(["cdn.discordapp.com", "media.discordapp.net"]);
 const EXT_IMAGE_CDN_HOST_RE = /^images-ext-\d+\.discordapp\.net$/;
@@ -226,4 +226,54 @@ export function checkVoiceGate(draft: string, externalMessages: string[]): Voice
     reasons,
     maxConsecutiveOverlap,
   };
+}
+
+const DISCORD_WEB_HOSTS = new Set([
+  "discord.com",
+  "ptb.discord.com",
+  "canary.discord.com",
+  "discordapp.com",
+]);
+const SNOWFLAKE_RE = /^\d{15,22}$/;
+
+/** Parse https://discord.com/channels/<guildId>/<channelId>[/<messageId>] while rejecting @me DMs. */
+export function parseDiscordChannelUrl(rawUrl: string): ParsedDiscordChannelUrl {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    throw new Error(`Invalid Discord channel URL: ${rawUrl}`);
+  }
+  if (parsed.protocol !== "https:" || !DISCORD_WEB_HOSTS.has(parsed.hostname.toLowerCase())) {
+    throw new Error(`Unsupported Discord URL host or protocol: ${rawUrl}`);
+  }
+  const match = /^\/channels\/([^/]+)\/([^/]+)(?:\/([^/]+))?\/?$/.exec(parsed.pathname);
+  if (!match) {
+    throw new Error(
+      `Expected /channels/<guildId>/<channelId> URL path in ${rawUrl}`
+    );
+  }
+  const guildId = match[1]!;
+  const channelId = match[2]!;
+  const messageId = match[3];
+  if (guildId.toLowerCase() === "@me") {
+    throw new Error("Direct message (@me) URLs are quarantined and cannot be tracked.");
+  }
+  if (!SNOWFLAKE_RE.test(guildId) || !SNOWFLAKE_RE.test(channelId)) {
+    throw new Error(`Invalid Discord Snowflake IDs in URL: ${rawUrl}`);
+  }
+  if (messageId && !SNOWFLAKE_RE.test(messageId)) {
+    throw new Error(`Invalid Discord message Snowflake ID in URL: ${rawUrl}`);
+  }
+  return {
+    guildId,
+    channelId,
+    ...(messageId ? { messageId } : {}),
+    canonicalUrl: `https://discord.com/channels/${guildId}/${channelId}`,
+  };
+}
+
+/** Replace 15 to 22 digit Discord Snowflake IDs so demo packs never leak channel or guild IDs. */
+export function scrubSnowflakeIds(text: string): string {
+  return text.replace(/\b\d{15,22}\b/g, "[id]");
 }

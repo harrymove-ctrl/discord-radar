@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
@@ -8,9 +9,13 @@ import {
   buildContentBrief,
   checkVoiceGate,
   ensureDailyScheduleState,
+  exportDemoPack,
   extractSignals,
+  ingestPendingSources,
   isQuarantinedDm,
+  loadDemandProfiles,
   parseBrowserSnapshot,
+  parseDiscordChannelUrl,
   pickDailyTargetMinute,
   redactSecrets,
   runDailyDigest,
@@ -18,6 +23,7 @@ import {
   stripContentSlop,
   translateContentBrief,
   translateText,
+  upsertLocalCaptureSources,
   validateDiscordCdnUrl,
 } from "../src/index.ts";
 
@@ -499,6 +505,161 @@ describe("discord-radar safety and signal pipeline", () => {
       expect(nextDayState.date).toBe("2026-11-16");
       expect(nextDayState.targetTime).toBe("14:25");
       expect(nextDayState.completedAt).toBeNull();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("parses Discord channel URLs cleanly while rejecting @me DM URLs", () => {
+    const channelUrl = parseDiscordChannelUrl(
+      "https://discord.com/channels/100000000000000001/200000000000000002"
+    );
+    expect(channelUrl.guildId).toBe("100000000000000001");
+    expect(channelUrl.channelId).toBe("200000000000000002");
+    expect(channelUrl.canonicalUrl).toBe(
+      "https://discord.com/channels/100000000000000001/200000000000000002"
+    );
+
+    const msgUrl = parseDiscordChannelUrl(
+      "https://ptb.discord.com/channels/100000000000000001/200000000000000002/300000000000000003"
+    );
+    expect(msgUrl.messageId).toBe("300000000000000003");
+
+    expect(() =>
+      parseDiscordChannelUrl("https://discord.com/channels/@me/200000000000000002")
+    ).toThrow("@me");
+  });
+
+  test("ingestPendingSources reads discrawl Forum/channel schema cleanly and exportDemoPack scrubs Snowflakes", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "discord-radar-demopack-"));
+    try {
+      const dbPath = path.join(tmpDir, "radar.db");
+      const extDbPath = path.join(tmpDir, "discrawl-ext.db");
+      const inboxDir = path.join(tmpDir, "inbox");
+      const demoOutDir = path.join(tmpDir, "demo-packs");
+      const demandsFile = path.join(tmpDir, "demands.local.json");
+      const wiretapToml = path.join(tmpDir, "wiretap.local.toml");
+
+      fs.writeFileSync(
+        wiretapToml,
+        `db_path = ${JSON.stringify(extDbPath)}\ndefault_guild_id = "REPLACE"\nguild_ids = []\n`
+      );
+
+      const upsert = upsertLocalCaptureSources({
+        demandsFile,
+        wiretapConfigPath: wiretapToml,
+        demandId: "demo-test",
+        label: "Demo Signal Suite",
+        urls: [
+          "https://discord.com/channels/100000000000000001/200000000000000002",
+          "https://discord.com/channels/100000000000000001/300000000000000003",
+        ],
+        keywords: ["mcp", "workflow", "bug"],
+        ownedTargetChannel: "#demo-feed",
+      });
+      expect(upsert.wiretapGuildIds).toEqual(["100000000000000001"]);
+
+      const extDb = new Database(extDbPath, { create: true });
+      try {
+        extDb.exec(`
+          CREATE TABLE channels (
+            id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            parent_id TEXT
+          );
+          CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            author_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+        `);
+
+        const nowIso = new Date(Date.now() - 5 * 60_000).toISOString();
+        extDb
+          .prepare("INSERT INTO channels (id, guild_id, name, parent_id) VALUES (?, ?, ?, ?)")
+          .run("200000000000000002", "100000000000000001", "general-help", null);
+        extDb
+          .prepare("INSERT INTO channels (id, guild_id, name, parent_id) VALUES (?, ?, ?, ?)")
+          .run("300000000000000003", "100000000000000001", "bug-forum", null);
+        extDb
+          .prepare("INSERT INTO channels (id, guild_id, name, parent_id) VALUES (?, ?, ?, ?)")
+          .run("400000000000000004", "100000000000000001", "mcp-timeout-thread", "300000000000000003");
+
+        const insMsg = extDb.prepare(
+          "INSERT INTO messages (id, guild_id, channel_id, author_id, content, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+        );
+        insMsg.run(
+          "700000000000000001",
+          "100000000000000001",
+          "200000000000000002",
+          "500000000000000001",
+          "How does workflow mcp setup behave inside 200000000000000002?",
+          nowIso
+        );
+        insMsg.run(
+          "700000000000000002",
+          "100000000000000001",
+          "400000000000000004",
+          "500000000000000002",
+          "Recurring mcp bug timeout on local runs reported in 300000000000000003.",
+          nowIso
+        );
+        insMsg.run(
+          "700000000000000003",
+          "@me",
+          "900000000000000009",
+          "500000000000000003",
+          "Private DM message that must never enter vault",
+          nowIso
+        );
+        insMsg.run(
+          "700000000000000004",
+          "100000000000000001",
+          "888888888888888888",
+          "500000000000000004",
+          "Unrelated channel chatter outside subscribed channels",
+          nowIso
+        );
+      } finally {
+        extDb.close();
+      }
+
+      const { demands } = loadDemandProfiles(demandsFile);
+      const vault = new RadarVault(dbPath);
+      try {
+        const ingest = ingestPendingSources(vault, demands, {
+          inboxDir,
+          wiretapConfigPath: wiretapToml,
+          discrawlBin: "/usr/bin/true",
+        });
+        expect(ingest.wiretapStatus).toBe("ingested");
+        expect(ingest.inserted).toBe(2);
+        expect(vault.searchMessages("Private DM")).toHaveLength(0);
+        expect(vault.searchMessages("Unrelated")).toHaveLength(0);
+      } finally {
+        vault.close();
+      }
+
+      const pack = await exportDemoPack({
+        dbPath,
+        demandsFile,
+        outDir: demoOutDir,
+        demandId: "demo-test",
+        hours: 24,
+      });
+
+      expect(pack.totalMatchedMessages).toBe(2);
+      expect(pack.voiceGate.ok).toBe(true);
+      expect(pack.channelCoverage.length).toBeGreaterThanOrEqual(2);
+
+      const mdText = fs.readFileSync(pack.markdownPath, "utf8");
+      const jsonText = fs.readFileSync(pack.jsonPath, "utf8");
+      expect(mdText).not.toMatch(/\b\d{15,22}\b/);
+      expect(jsonText).not.toMatch(/\b\d{15,22}\b/);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

@@ -107,6 +107,20 @@ bun run schedule --preview-days 5 --window-start 08:00 --window-end 18:00 --json
 bun run schedule --install-cron --window-start 08:00 --window-end 18:00 --tz Asia/Ho_Chi_Minh --json
 ```
 
+4. **Channel URL Wiring (`source:add`) & Demo Insights Pack (`demo:pack`)**: Paste full Discord channel URLs (from servers you follow as a member) directly without editing IDs by hand. Discord Radar saves the parsed IDs into gitignored `configs/demands.local.json`, updates your local wiretap TOML, reads Forum threads automatically, scrubs all Discord Snowflake IDs (`[id]`), and verifies `checkVoiceGate` before writing `.state/demo-packs/<demand>.{md,json}`:
+
+```zsh
+bun run source:add \
+  --demand demo-insights \
+  --label "Demo Community Insights" \
+  --url "https://discord.com/channels/100000000000000001/200000000000000002" \
+  --keywords "mcp,agent,bug,workflow" \
+  --json
+
+bun run digest --hours 720 --json
+bun run demo:pack --demand demo-insights --json
+```
+
 ## 5. CLI Command Reference (`schema_version: "1"`)
 
 All commands support `--json` and emit `{ ok, schema_version, data | error }` automatically when stdout is non TTY:
@@ -115,12 +129,14 @@ All commands support `--json` and emit `{ ok, schema_version, data | error }` au
 | :--- | :--- | :--- |
 | `doctor` | Verify DB path, `DISCORD_BOT_TOKEN` Bot prefix format, `discrawl` binary, and active demand config | `--db`, `--demands-file`, `--json` |
 | `targets` | Display active topic profiles loaded from `configs/demands.local.json` or `configs/demands.example.json` | `--demands-file`, `--json` |
-| `ingest-snapshot` | Parse browser JSON, accessibility trees, or timestamped logs into SQLite | `--file`, `--guild`, `--channel`, `--channel-name`, `--db` |
+| `add-source` | Register full Discord channel URLs into gitignored local demand and wiretap configs | `--url`, `--demand`, `--label`, `--keywords`, `--target-channel` |
+| `ingest-snapshot` | Parse browser JSON, accessibility trees, or timestamped logs into SQLite | `--file`, `--url`, `--guild`, `--channel`, `--channel-name`, `--db` |
 | `ingest-jsonl` | Import JSONL message streams from `discrawl` SQL queries or Bot exporters | `--file`, `--tier`, `--guild`, `--channel`, `--db` |
-| `today` | List archived messages from the last `N` hours excluding quarantined `@me` DMs | `--hours`, `--guild`, `--channel`, `--limit`, `--db` |
-| `search` | Run BM25 ranked SQLite FTS5 full text search across stored discussions | `<query>`, `--guild`, `--channel`, `--limit`, `--db` |
-| `signals` | Cluster questions, recurring bugs, feature requests, and comparisons by keyword score | `--demand`, `--keywords`, `--hours`, `--demands-file` |
-| `brief` | Generate a headline, outline, and `voiceGate` checked draft starter with optional `--lang` / `--pivot` translation | `--demand`, `--target-channel`, `--lang`, `--pivot`, `--from` |
+| `today` | List archived messages from the last `N` hours excluding quarantined `@me` DMs | `--hours`, `--url`, `--guild`, `--channel`, `--limit`, `--db` |
+| `search` | Run BM25 ranked SQLite FTS5 full text search across stored discussions | `<query>`, `--url`, `--guild`, `--channel`, `--limit`, `--db` |
+| `signals` | Cluster questions, recurring bugs, feature requests, and comparisons by keyword score | `--demand`, `--url`, `--keywords`, `--hours`, `--demands-file` |
+| `brief` | Generate a headline, outline, and `voiceGate` checked draft starter with optional `--lang` / `--pivot` translation | `--demand`, `--url`, `--target-channel`, `--lang`, `--pivot`, `--from` |
+| `demo-pack` | Export Snowflake scrubbed, anonymized, `voiceGate` checked insights Markdown and JSON for demos | `--demand`, `--url`, `--hours`, `--out-dir`, `--lang`, `--pivot` |
 | `digest` | Ingest `.state/inbox/` + configured wiretap, trace day over day topic deltas, and write `.state/digests/YYYY-MM-DD.{md,json}` | `--hours`, `--inbox-dir`, `--out-dir`, `--lang`, `--pivot` |
 | `schedule` | Pick one random daily run minute inside `08:00` to `18:00`, inspect upcoming slots, run ticks, or install crontab | `--install-cron`, `--preview-days`, `--tick`, `--window-start`, `--window-end`, `--tz` |
 | `translate` | Translate or back translate drafts with protected code/links/channels plus `stripContentSlop` and `checkVoiceGate` | `--text`, `--file`, `--to`, `--from`, `--pivot` |

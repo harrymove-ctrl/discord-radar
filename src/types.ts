@@ -14,6 +14,7 @@ export interface DemandCaptureSource {
   guildId: string;
   channelId: string;
   channelName?: string;
+  url?: string;
 }
 
 export interface DemandProfile {
@@ -173,6 +174,33 @@ export interface ScheduleTickResult {
   nowTime: string;
   state: DailyScheduleState;
   digest?: DailyDigestReport;
+}
+
+export interface ParsedDiscordChannelUrl {
+  guildId: string;
+  channelId: string;
+  messageId?: string;
+  canonicalUrl: string;
+}
+
+export interface DemoChannelCoverage {
+  alias: string;
+  messageCount: number;
+}
+
+export interface DemoInsightsPack {
+  demandId: string;
+  demandLabel: string;
+  generatedAt: string;
+  hoursWindow: number;
+  totalMatchedMessages: number;
+  channelCoverage: DemoChannelCoverage[];
+  topSignals: SignalCluster[];
+  demoTalkingPoints: string[];
+  brief: ContentBrief;
+  voiceGate: VoiceGateResult;
+  markdownPath: string;
+  jsonPath: string;
 }
 
 /** Structured CLI output envelope aligned with SCHEMA.md agent tooling conventions. */
