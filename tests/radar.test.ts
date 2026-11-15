@@ -542,7 +542,7 @@ describe("discord-radar safety and signal pipeline", () => {
 
       fs.writeFileSync(
         wiretapToml,
-        `db_path = ${JSON.stringify(extDbPath)}\ndefault_guild_id = "REPLACE"\nguild_ids = []\n`
+        `db_path = ${JSON.stringify(extDbPath)}\ndefault_guild_id = "REPLACE"\nguild_ids = []\n\n[search]\nlexical = "fts5"\n`
       );
 
       const upsert = upsertLocalCaptureSources({
@@ -558,6 +558,9 @@ describe("discord-radar safety and signal pipeline", () => {
         ownedTargetChannel: "#demo-feed",
       });
       expect(upsert.wiretapGuildIds).toEqual(["100000000000000001"]);
+      const updatedToml = fs.readFileSync(wiretapToml, "utf8");
+      expect(updatedToml).toContain('default_mode = "fts"');
+      expect(updatedToml).not.toContain('lexical = "fts5"');
 
       const extDb = new Database(extDbPath, { create: true });
       try {
@@ -566,7 +569,8 @@ describe("discord-radar safety and signal pipeline", () => {
             id TEXT PRIMARY KEY,
             guild_id TEXT NOT NULL,
             name TEXT NOT NULL,
-            parent_id TEXT
+            parent_id TEXT,
+            thread_parent_id TEXT
           );
           CREATE TABLE messages (
             id TEXT PRIMARY KEY,
@@ -574,29 +578,31 @@ describe("discord-radar safety and signal pipeline", () => {
             channel_id TEXT NOT NULL,
             author_id TEXT NOT NULL,
             content TEXT NOT NULL,
+            normalized_content TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
           );
         `);
 
         const nowIso = new Date(Date.now() - 5 * 60_000).toISOString();
         extDb
-          .prepare("INSERT INTO channels (id, guild_id, name, parent_id) VALUES (?, ?, ?, ?)")
-          .run("200000000000000002", "100000000000000001", "general-help", null);
+          .prepare("INSERT INTO channels (id, guild_id, name, parent_id, thread_parent_id) VALUES (?, ?, ?, ?, ?)")
+          .run("200000000000000002", "100000000000000001", "general-help", null, null);
         extDb
-          .prepare("INSERT INTO channels (id, guild_id, name, parent_id) VALUES (?, ?, ?, ?)")
-          .run("300000000000000003", "100000000000000001", "bug-forum", null);
+          .prepare("INSERT INTO channels (id, guild_id, name, parent_id, thread_parent_id) VALUES (?, ?, ?, ?, ?)")
+          .run("300000000000000003", "100000000000000001", "bug-forum", null, null);
         extDb
-          .prepare("INSERT INTO channels (id, guild_id, name, parent_id) VALUES (?, ?, ?, ?)")
-          .run("400000000000000004", "100000000000000001", "mcp-timeout-thread", "300000000000000003");
+          .prepare("INSERT INTO channels (id, guild_id, name, parent_id, thread_parent_id) VALUES (?, ?, ?, ?, ?)")
+          .run("400000000000000004", "100000000000000001", "mcp-timeout-thread", "300000000000000003", "300000000000000003");
 
         const insMsg = extDb.prepare(
-          "INSERT INTO messages (id, guild_id, channel_id, author_id, content, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+          "INSERT INTO messages (id, guild_id, channel_id, author_id, content, normalized_content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
         );
         insMsg.run(
           "700000000000000001",
           "100000000000000001",
           "200000000000000002",
           "500000000000000001",
+          "How does workflow mcp setup behave inside 200000000000000002?",
           "How does workflow mcp setup behave inside 200000000000000002?",
           nowIso
         );
@@ -606,6 +612,7 @@ describe("discord-radar safety and signal pipeline", () => {
           "400000000000000004",
           "500000000000000002",
           "Recurring mcp bug timeout on local runs reported in 300000000000000003.",
+          "Recurring mcp bug timeout on local runs reported in 300000000000000003.",
           nowIso
         );
         insMsg.run(
@@ -614,6 +621,7 @@ describe("discord-radar safety and signal pipeline", () => {
           "900000000000000009",
           "500000000000000003",
           "Private DM message that must never enter vault",
+          "Private DM message that must never enter vault",
           nowIso
         );
         insMsg.run(
@@ -621,6 +629,7 @@ describe("discord-radar safety and signal pipeline", () => {
           "100000000000000001",
           "888888888888888888",
           "500000000000000004",
+          "Unrelated channel chatter outside subscribed channels",
           "Unrelated channel chatter outside subscribed channels",
           nowIso
         );

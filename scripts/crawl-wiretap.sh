@@ -13,6 +13,12 @@ cd "$REPO_ROOT"
 
 CONFIG_PATH="${1:-${DISCRAWL_CONFIG:-configs/discrawl-external-wiretap.local.toml}}"
 WIRETAP_FLAG="${2:-}"
+if [[ -z "${DISCRAWL_BIN:-}" && -f "$REPO_ROOT/.env" ]]; then
+  ENV_DISCRAWL_BIN="$(grep -E '^DISCRAWL_BIN=' "$REPO_ROOT/.env" | head -n1 | cut -d= -f2- || true)"
+  if [[ -n "$ENV_DISCRAWL_BIN" ]]; then
+    DISCRAWL_BIN="$ENV_DISCRAWL_BIN"
+  fi
+fi
 DISCRAWL_EXEC="${DISCRAWL_BIN:-discrawl}"
 
 if [[ ! -x "$DISCRAWL_EXEC" ]]; then
@@ -41,5 +47,6 @@ fi
 
 SQL_QUERY="SELECT m.id AS message_id, m.guild_id, m.channel_id, COALESCE(c.name, m.channel_id) AS channel_name, m.author_id, m.content, m.created_at FROM messages m LEFT JOIN channels c ON c.id = m.channel_id WHERE lower(m.guild_id) != '@me' ORDER BY m.created_at DESC LIMIT 500"
 
-"$DISCRAWL_EXEC" --config "$CONFIG_PATH" sql "$SQL_QUERY" --jsonl | \
+"$DISCRAWL_EXEC" --json --config "$CONFIG_PATH" sql "$SQL_QUERY" | \
+  bun -e 'const raw = (await Bun.stdin.text()).trim(); if (raw) { const parsed = JSON.parse(raw); const rows = Array.isArray(parsed) ? parsed : (parsed.rows ?? []); for (const r of rows) console.log(JSON.stringify(r)); }' | \
   bun run src/cli.ts ingest-jsonl --tier desktop_wiretap --db "${RADAR_DB_PATH:-.state/radar.db}" --json

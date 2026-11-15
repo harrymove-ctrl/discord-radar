@@ -252,8 +252,7 @@ function resolveDiscrawlDbPath(tomlBody: string, wiretapConfigPath: string): str
   return path.resolve(path.dirname(wiretapConfigPath), raw);
 }
 
-  // Fallback helper for TOML readers above
-  // Read discrawl SQLite tables directly in readonly mode so schema and parent threads match cleanly.
+// Read discrawl SQLite tables directly in readonly mode so schema and parent threads match cleanly.
 function readWiretapDatabaseRows(
   discrawlDbPath: string,
   wiretapGuilds: string[],
@@ -281,6 +280,9 @@ function readWiretapDatabaseRows(
       : msgCols.has("sent_at")
         ? "m.sent_at"
         : "''";
+    const contentExpr = msgCols.has("normalized_content")
+      ? "COALESCE(NULLIF(m.content, ''), m.normalized_content, '')"
+      : "m.content";
     const authorIdExpr = msgCols.has("author_id") ? "m.author_id" : "''";
     const authorNameExpr = msgCols.has("author_name")
       ? "m.author_name"
@@ -290,8 +292,9 @@ function readWiretapDatabaseRows(
     const hasChannels = chanCols.has("id");
     const hasChannelName = hasChannels && chanCols.has("name");
     const hasParentId = hasChannels && chanCols.has("parent_id");
+    const hasThreadParentId = hasChannels && chanCols.has("thread_parent_id");
 
-    const conditions = ["lower(m.guild_id) != '@me'"];
+    const conditions = ["lower(m.guild_id) != '@me'", `trim(${contentExpr}) != ''`];
     const params: string[] = [];
 
     if (wiretapGuilds.length > 0) {
@@ -302,14 +305,26 @@ function readWiretapDatabaseRows(
     const channelSet = new Set(wiretapChannels);
     if (wiretapChannels.length > 0) {
       const chPh = wiretapChannels.map(() => "?").join(", ");
+      const channelClauses = [`m.channel_id IN (${chPh})`];
+      params.push(...wiretapChannels);
       if (hasParentId) {
-        conditions.push(`(m.channel_id IN (${chPh}) OR c.parent_id IN (${chPh}))`);
-        params.push(...wiretapChannels, ...wiretapChannels);
-      } else {
-        conditions.push(`m.channel_id IN (${chPh})`);
+        channelClauses.push(`c.parent_id IN (${chPh})`);
         params.push(...wiretapChannels);
       }
+      if (hasThreadParentId) {
+        channelClauses.push(`c.thread_parent_id IN (${chPh})`);
+        params.push(...wiretapChannels);
+      }
+      conditions.push(`(${channelClauses.join(" OR ")})`);
     }
+
+    const joinParent = hasParentId || hasThreadParentId;
+    const parentLookupExpr =
+      hasThreadParentId && hasParentId
+        ? "COALESCE(NULLIF(c.thread_parent_id, ''), NULLIF(c.parent_id, ''))"
+        : hasThreadParentId
+          ? "NULLIF(c.thread_parent_id, '')"
+          : "NULLIF(c.parent_id, '')";
 
     const sql = `
       SELECT
@@ -317,13 +332,16 @@ function readWiretapDatabaseRows(
         m.guild_id AS guild_id,
         m.channel_id AS channel_id,
         ${hasChannelName ? "COALESCE(c.name, m.channel_id)" : "m.channel_id"} AS channel_name,
+        ${joinParent && hasChannelName ? "COALESCE(pc.name, c.name, m.channel_id)" : hasChannelName ? "COALESCE(c.name, m.channel_id)" : "m.channel_id"} AS parent_channel_name,
         ${hasParentId ? "COALESCE(c.parent_id, '')" : "''"} AS parent_id,
+        ${hasThreadParentId ? "COALESCE(c.thread_parent_id, '')" : "''"} AS thread_parent_id,
         ${authorIdExpr} AS author_id,
         ${authorNameExpr} AS author_name,
-        m.content AS content,
+        ${contentExpr} AS content,
         ${timeExpr} AS created_at
       FROM messages m
       ${hasChannels ? "LEFT JOIN channels c ON c.id = m.channel_id" : ""}
+      ${joinParent ? `LEFT JOIN channels pc ON pc.id = ${parentLookupExpr}` : ""}
       WHERE ${conditions.join(" AND ")}
       ORDER BY created_at DESC
       LIMIT 1000
@@ -331,15 +349,26 @@ function readWiretapDatabaseRows(
 
     const rawRows = extDb.prepare(sql).all(...params) as Array<Record<string, unknown>>;
     return rawRows.map((row) => {
+      const threadParentId =
+        typeof row.thread_parent_id === "string" ? row.thread_parent_id.trim() : "";
       const parentId = typeof row.parent_id === "string" ? row.parent_id.trim() : "";
       const rawChannelId = String(row.channel_id ?? "").trim();
-      const effectiveChannelId = parentId && channelSet.has(parentId) ? parentId : rawChannelId;
+      const effectiveChannelId =
+        threadParentId && channelSet.has(threadParentId)
+          ? threadParentId
+          : parentId && channelSet.has(parentId)
+            ? parentId
+            : rawChannelId;
       const msgId = typeof row.message_id === "string" ? row.message_id.trim() : "";
+      const rawName =
+        effectiveChannelId !== rawChannelId
+          ? String(row.parent_channel_name ?? row.channel_name ?? effectiveChannelId)
+          : String(row.channel_name ?? effectiveChannelId);
       return {
         messageId: msgId || undefined,
         guildId: String(row.guild_id ?? "").trim(),
         channelId: effectiveChannelId,
-        channelName: String(row.channel_name ?? effectiveChannelId).trim() || effectiveChannelId,
+        channelName: rawName.trim() || effectiveChannelId,
         authorId: typeof row.author_id === "string" ? row.author_id : undefined,
         authorName: String(row.author_name ?? "unknown"),
         content: String(row.content ?? ""),
@@ -814,7 +843,10 @@ export function upsertLocalCaptureSources(opts: UpsertSourceOptions): {
       : [
           "# Local untracked discrawl wiretap config (chmod 600).",
           "",
+          "version = 1",
           'db_path = ".state/discrawl-external.db"',
+          'cache_dir = ".state/discrawl-cache"',
+          'log_dir = ".state/discrawl-logs"',
           `default_guild_id = ${JSON.stringify(defaultGuild)}`,
           `guild_ids = [${guildIdsList}]`,
           "",
@@ -827,12 +859,35 @@ export function upsertLocalCaptureSources(opts: UpsertSourceOptions): {
           "auto_update = false",
           "",
           "[search]",
-          'lexical = "fts5"',
+          'default_mode = "fts"',
           "",
           "[search.embeddings]",
           "enabled = false",
           "",
         ].join("\n");
+
+    tomlContent = tomlContent.replace(
+      /^\s*lexical\s*=\s*["'][^"']*["']\s*$/gm,
+      'default_mode = "fts"'
+    );
+
+    const missingRuntimeDirs: string[] = [];
+    if (!/^\s*cache_dir\s*=/m.test(tomlContent)) {
+      missingRuntimeDirs.push('cache_dir = ".state/discrawl-cache"');
+    }
+    if (!/^\s*log_dir\s*=/m.test(tomlContent)) {
+      missingRuntimeDirs.push('log_dir = ".state/discrawl-logs"');
+    }
+    if (missingRuntimeDirs.length > 0) {
+      if (/^\s*db_path\s*=.*$/m.test(tomlContent)) {
+        tomlContent = tomlContent.replace(
+          /^\s*db_path\s*=.*$/m,
+          (line) => `${line}\n${missingRuntimeDirs.join("\n")}`
+        );
+      } else {
+        tomlContent = `${missingRuntimeDirs.join("\n")}\n${tomlContent}`;
+      }
+    }
 
     if (/^default_guild_id\s*=.*$/m.test(tomlContent)) {
       tomlContent = tomlContent.replace(
