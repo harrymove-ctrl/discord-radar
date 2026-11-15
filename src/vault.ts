@@ -10,6 +10,7 @@ interface MessageRow {
   message_id: string;
   guild_id: string;
   channel_id: string;
+  thread_id?: string;
   channel_name: string;
   author_ref: string;
   content: string;
@@ -29,11 +30,13 @@ function rowToStored(row: MessageRow): StoredMessage {
   } catch {
     attachments = [];
   }
+  const threadId = typeof row.thread_id === "string" ? row.thread_id.trim() : "";
   return {
     dedupKey: row.dedup_key,
     messageId: row.message_id,
     guildId: row.guild_id,
     channelId: row.channel_id,
+    ...(threadId ? { threadId } : {}),
     channelName: row.channel_name,
     authorRef: row.author_ref,
     content: row.content,
@@ -92,6 +95,7 @@ export class RadarVault {
         message_id TEXT NOT NULL DEFAULT '',
         guild_id TEXT NOT NULL,
         channel_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL DEFAULT '',
         channel_name TEXT NOT NULL,
         author_ref TEXT NOT NULL,
         content TEXT NOT NULL,
@@ -128,6 +132,11 @@ export class RadarVault {
         VALUES (new.rowid, new.content, new.channel_name);
       END;
     `);
+
+    const cols = this.db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "thread_id")) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN thread_id TEXT NOT NULL DEFAULT '';");
+    }
   }
 
   /** Ingest normalized messages across Bot, desktop cache wiretap, or browser snapshots. */
@@ -143,6 +152,7 @@ export class RadarVault {
         message_id,
         guild_id,
         channel_id,
+        thread_id,
         channel_name,
         author_ref,
         content,
@@ -150,7 +160,7 @@ export class RadarVault {
         created_at,
         source_tier,
         ingested_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const nowIso = new Date().toISOString();
@@ -184,6 +194,7 @@ export class RadarVault {
         }
 
         const channelId = item.channelId.trim();
+        const threadId = (item.threadId ?? "").trim();
         const channelName = (item.channelName ?? channelId).trim();
         const createdAt = item.createdAt.trim() || nowIso;
 
@@ -199,6 +210,7 @@ export class RadarVault {
           trimmedMsgId,
           item.guildId.trim(),
           channelId,
+          threadId,
           channelName,
           authorRef,
           storedContent,

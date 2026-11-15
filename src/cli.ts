@@ -23,7 +23,13 @@ import {
 import { buildContentBrief, extractSignals } from "./signals.ts";
 import { parseBrowserSnapshot } from "./snapshot.ts";
 import { translateContentBrief, translateText } from "./translate.ts";
-import type { CliEnvelope, NormalizedMessage, SourceTier } from "./types.ts";
+import type {
+  CliEnvelope,
+  NormalizedMessage,
+  SourceTier,
+  UpstreamRepoTarget,
+} from "./types.ts";
+import { runUpstreamRadar } from "./upstream.ts";
 import { RadarVault } from "./vault.ts";
 
 interface CliOptions {
@@ -55,6 +61,7 @@ interface CliOptions {
   windowEnd: string;
   timeZone: string;
   stateFile: string;
+  repos: string[];
   tick: boolean;
   force: boolean;
   status: boolean;
@@ -62,6 +69,7 @@ interface CliOptions {
   installCron: boolean;
   uninstallCron: boolean;
   noIngest: boolean;
+  withUpstream: boolean;
   positionals: string[];
 }
 
@@ -96,6 +104,7 @@ function parseFlags(argv: string[]): { command: string; opts: CliOptions } {
     windowEnd: process.env.RADAR_WINDOW_END?.trim() || "18:00",
     timeZone: process.env.RADAR_TIMEZONE?.trim() || "",
     stateFile: "",
+    repos: [],
     tick: false,
     force: false,
     status: false,
@@ -103,6 +112,7 @@ function parseFlags(argv: string[]): { command: string; opts: CliOptions } {
     installCron: false,
     uninstallCron: false,
     noIngest: false,
+    withUpstream: false,
     positionals: [],
   };
 
@@ -115,6 +125,13 @@ function parseFlags(argv: string[]): { command: string; opts: CliOptions } {
     else if (arg === "--install-cron") opts.installCron = true;
     else if (arg === "--uninstall-cron") opts.uninstallCron = true;
     else if (arg === "--no-ingest") opts.noIngest = true;
+    else if (arg === "--with-upstream") opts.withUpstream = true;
+    else if (arg === "--repos" && argv[i + 1]) {
+      opts.repos = argv[++i]!
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
     else if (arg === "--db" && argv[i + 1]) {
       opts.dbPath = argv[++i]!;
     } else if (arg === "--out-dir" && argv[i + 1]) {
@@ -367,6 +384,25 @@ async function run(): Promise<void> {
       return;
     }
 
+    if (command === "upstream-radar") {
+      const targets: UpstreamRepoTarget[] | undefined =
+        opts.repos.length > 0
+          ? opts.repos.map((repo) => ({
+              repo,
+              query: repo.toLowerCase().endsWith("/opencli") ? "discord" : "",
+              trackMainCommits: true,
+            }))
+          : undefined;
+      const report = await runUpstreamRadar({
+        targets,
+        limit: opts.limit === 50 ? 8 : opts.limit,
+        outDir: opts.outDir || undefined,
+        statePath: opts.stateFile || undefined,
+      });
+      emit(opts, { ok: true, schema_version: "1", data: report });
+      return;
+    }
+
     if (command === "digest") {
       const report = await runDailyDigest({
         dbPath: opts.dbPath,
@@ -379,6 +415,7 @@ async function run(): Promise<void> {
         pivotLang: opts.pivotLang || undefined,
         timeZone: opts.timeZone || undefined,
         autoIngest: !opts.noIngest,
+        includeUpstream: opts.withUpstream,
       });
       emit(opts, { ok: true, schema_version: "1", data: report });
       return;
@@ -426,6 +463,7 @@ async function run(): Promise<void> {
             fromLang: opts.fromLang,
             pivotLang: opts.pivotLang || undefined,
             autoIngest: !opts.noIngest,
+            includeUpstream: opts.withUpstream,
           },
         });
         emit(opts, { ok: true, schema_version: "1", data: tickResult });
@@ -554,7 +592,7 @@ async function run(): Promise<void> {
       error: {
         code: "unknown_command",
         message: `Unknown command "${command}".`,
-        hint: "Use doctor, targets, add-source, ingest-snapshot, ingest-jsonl, today, search, signals, brief, demo-pack, digest, schedule, translate, or voice-check.",
+        hint: "Use doctor, targets, add-source, ingest-snapshot, ingest-jsonl, today, search, signals, brief, demo-pack, digest, schedule, upstream-radar, translate, or voice-check.",
       },
     });
     process.exitCode = 1;

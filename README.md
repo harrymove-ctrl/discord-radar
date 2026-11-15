@@ -94,10 +94,10 @@ bun run translate --text "Your draft text here" --from en --to en --pivot vi --j
 Discord Radar tracks how community discussions change day over day without running at the same clock minute every morning:
 
 1. **Snapshot Drop Folder (`.state/inbox/`)**: Drop `.json`, `.jsonl`, or `.txt` browser snapshots into `.state/inbox/` (optionally named `<guildId>__<channelId>__<channelName>.json` or matching a configured `channelName`). Every `digest` run ingests queued files, triggers passive local `discrawl` cache extraction when configured, and archives processed files under `.state/inbox/processed/`.
-2. **Delta Signal Tracing (`digest`)**: `bun run digest` compares today's clusters against the newest prior `YYYY-MM-DD.json` report in `.state/digests/`, tagging every topic as `new`, `rising`, `steady`, or `cooling` with exact post count deltas and a `voiceGate` checked Markdown summary:
+2. **Delta Signal Tracing (`digest`)**: `bun run digest` compares today's clusters against the newest prior `YYYY-MM-DD.json` report in `.state/digests/`, tagging every topic as `new`, `rising`, `steady`, or `cooling` with exact post count deltas, direct `https://discord.com/channels/...` thread links, and a `voiceGate` checked Markdown summary:
 
 ```zsh
-bun run digest --lang vi --json
+bun run digest --with-upstream --lang vi --json
 ```
 
 3. **Daily Randomized Execution Window (`schedule`)**: Instead of hitting the same fixed minute each day, `src/schedule.ts` picks one random minute per calendar day inside `--window-start` (`08:00`) through `--window-end` (`18:00`) in your local timezone. Polling every 5 minutes via cron checks `.state/schedule-state.json`, executes `digest` once when the random slot arrives, logs runs into `.state/schedule.log`, and records daily history in `.state/schedule-history.jsonl`:
@@ -117,8 +117,14 @@ bun run source:add \
   --keywords "mcp,agent,bug,workflow" \
   --json
 
-bun run digest --hours 720 --json
+bun run digest --hours 720 --with-upstream --json
 bun run demo:pack --demand demo-insights --json
+```
+
+5. **Upstream CLI Radar (`upstream:radar`)**: Track Discord adapter issues, pull requests, and `main` commits in `jackwener/OpenCLI` and `jackwener/discord-cli`, map edge cases (such as `OpenCLI` embed-only bot cards, quoted reply previews, and date-divider authors handled in [`src/snapshot.ts`](./src/snapshot.ts)) into `.state/upstream/latest.{md,json}`, and filter out any token extraction or anti-bot suggestions under `PRD-01 R1`:
+
+```zsh
+bun run upstream:radar --json
 ```
 
 ## 5. CLI Command Reference (`schema_version: "1"`)
@@ -130,15 +136,16 @@ All commands support `--json` and emit `{ ok, schema_version, data | error }` au
 | `doctor` | Verify DB path, `DISCORD_BOT_TOKEN` Bot prefix format, `discrawl` binary, and active demand config | `--db`, `--demands-file`, `--json` |
 | `targets` | Display active topic profiles loaded from `configs/demands.local.json` or `configs/demands.example.json` | `--demands-file`, `--json` |
 | `add-source` | Register full Discord channel URLs into gitignored local demand and wiretap configs | `--url`, `--demand`, `--label`, `--keywords`, `--target-channel` |
-| `ingest-snapshot` | Parse browser JSON, accessibility trees, or timestamped logs into SQLite | `--file`, `--url`, `--guild`, `--channel`, `--channel-name`, `--db` |
+| `ingest-snapshot` | Parse browser JSON (including `OpenCLI` `discord-app` embed/reply cards), accessibility trees, or timestamped logs into SQLite | `--file`, `--url`, `--guild`, `--channel`, `--channel-name`, `--db` |
 | `ingest-jsonl` | Import JSONL message streams from `discrawl` SQL queries or Bot exporters | `--file`, `--tier`, `--guild`, `--channel`, `--db` |
 | `today` | List archived messages from the last `N` hours excluding quarantined `@me` DMs | `--hours`, `--url`, `--guild`, `--channel`, `--limit`, `--db` |
 | `search` | Run BM25 ranked SQLite FTS5 full text search across stored discussions | `<query>`, `--url`, `--guild`, `--channel`, `--limit`, `--db` |
-| `signals` | Cluster questions, recurring bugs, feature requests, and comparisons by keyword score | `--demand`, `--url`, `--keywords`, `--hours`, `--demands-file` |
+| `signals` | Cluster questions, recurring bugs, feature requests, and comparisons with direct thread deep links | `--demand`, `--url`, `--keywords`, `--hours`, `--demands-file` |
 | `brief` | Generate a headline, outline, and `voiceGate` checked draft starter with optional `--lang` / `--pivot` translation | `--demand`, `--url`, `--target-channel`, `--lang`, `--pivot`, `--from` |
 | `demo-pack` | Export Snowflake scrubbed, anonymized, `voiceGate` checked insights Markdown and JSON for demos | `--demand`, `--url`, `--hours`, `--out-dir`, `--lang`, `--pivot` |
-| `digest` | Ingest `.state/inbox/` + configured wiretap, trace day over day topic deltas, and write `.state/digests/YYYY-MM-DD.{md,json}` | `--hours`, `--inbox-dir`, `--out-dir`, `--lang`, `--pivot` |
-| `schedule` | Pick one random daily run minute inside `08:00` to `18:00`, inspect upcoming slots, run ticks, or install crontab | `--install-cron`, `--preview-days`, `--tick`, `--window-start`, `--window-end`, `--tz` |
+| `digest` | Ingest `.state/inbox/` + configured wiretap, trace day over day topic deltas with thread links, and write `.state/digests/YYYY-MM-DD.{md,json}` | `--hours`, `--with-upstream`, `--inbox-dir`, `--out-dir`, `--lang`, `--pivot` |
+| `upstream-radar` | Track `jackwener/OpenCLI` and `jackwener/discord-cli` issues, PRs, and `main` commits into `.state/upstream/latest.{md,json}` | `--repos`, `--limit`, `--out-dir`, `--state-file`, `--json` |
+| `schedule` | Pick one random daily run minute inside `08:00` to `18:00`, inspect upcoming slots, run ticks, or install crontab | `--install-cron`, `--preview-days`, `--tick`, `--with-upstream`, `--window-start`, `--window-end`, `--tz` |
 | `translate` | Translate or back translate drafts with protected code/links/channels plus `stripContentSlop` and `checkVoiceGate` | `--text`, `--file`, `--to`, `--from`, `--pivot` |
 | `voice-check` | Validate drafts against AI filler phrases, zero width Unicode, HTML tags, dash slop, and verbatim overlap | `--draft`, `--file` |
 

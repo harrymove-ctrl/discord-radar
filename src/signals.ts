@@ -39,6 +39,27 @@ function cleanSnippet(content: string): string {
   return content.replace(/[\u2013\u2014]/g, ",").replace(/\s+-\s+/g, ": ").replace(/\s+/g, " ").trim().slice(0, 160);
 }
 
+const SNOWFLAKE_RE = /^\d{15,22}$/;
+
+/** Construct a direct Discord message or thread link when numeric Snowflake IDs are available. */
+export function buildDiscordMessageLink(
+  msg: Pick<StoredMessage, "guildId" | "channelId" | "threadId" | "messageId">
+): string | null {
+  const guildId = msg.guildId.trim();
+  const threadId = (msg.threadId ?? "").trim();
+  const channelId = msg.channelId.trim();
+  const messageId = (msg.messageId ?? "").trim();
+
+  if (!SNOWFLAKE_RE.test(guildId)) return null;
+  const targetChan = SNOWFLAKE_RE.test(threadId) ? threadId : channelId;
+  if (!SNOWFLAKE_RE.test(targetChan)) return null;
+
+  if (SNOWFLAKE_RE.test(messageId) && messageId !== targetChan) {
+    return `https://discord.com/channels/${guildId}/${targetChan}/${messageId}`;
+  }
+  return `https://discord.com/channels/${guildId}/${targetChan}`;
+}
+
 /** Cluster local vault messages into ranked demand weighted content opportunities. */
 export function extractSignals(
   messages: StoredMessage[],
@@ -56,6 +77,7 @@ export function extractSignals(
     matchedKeywords: Set<string>;
     channelNames: Set<string>;
     sampleSnippets: string[];
+    sourceLinks: Set<string>;
     latestAt: string;
   }
 
@@ -84,6 +106,7 @@ export function extractSignals(
         matchedKeywords: new Set<string>(),
         channelNames: new Set<string>(),
         sampleSnippets: [],
+        sourceLinks: new Set<string>(),
         latestAt: msg.createdAt,
       };
       buckets.set(key, bucket);
@@ -95,6 +118,12 @@ export function extractSignals(
     bucket.channelNames.add(msg.channelName);
     if (bucket.sampleSnippets.length < 3) {
       bucket.sampleSnippets.push(cleanSnippet(msg.content));
+    }
+    if (bucket.sourceLinks.size < 5) {
+      const link = buildDiscordMessageLink(msg);
+      if (link) {
+        bucket.sourceLinks.add(link);
+      }
     }
     if (msg.createdAt > bucket.latestAt) {
       bucket.latestAt = msg.createdAt;
@@ -114,6 +143,7 @@ export function extractSignals(
       matchedKeywords: Array.from(bucket.matchedKeywords),
       channelNames: Array.from(bucket.channelNames),
       sampleSnippets: bucket.sampleSnippets,
+      sourceLinks: Array.from(bucket.sourceLinks),
       latestAt: bucket.latestAt,
     });
     idx += 1;

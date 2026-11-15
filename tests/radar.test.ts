@@ -7,6 +7,7 @@ import {
   RadarVault,
   assertSafeBotToken,
   buildContentBrief,
+  buildDiscordMessageLink,
   checkVoiceGate,
   ensureDailyScheduleState,
   exportDemoPack,
@@ -18,8 +19,10 @@ import {
   parseDiscordChannelUrl,
   pickDailyTargetMinute,
   redactSecrets,
+  renderUpstreamMarkdown,
   runDailyDigest,
   runScheduleTick,
+  runUpstreamRadar,
   stripContentSlop,
   translateContentBrief,
   translateText,
@@ -682,6 +685,201 @@ describe("discord-radar safety and signal pipeline", () => {
       const jsonText = fs.readFileSync(pack.jsonPath, "utf8");
       expect(mdText).not.toMatch(/\b\d{15,22}\b/);
       expect(jsonText).not.toMatch(/\b\d{15,22}\b/);
+      for (const sig of pack.topSignals) {
+        expect(sig.sourceLinks).toEqual([]);
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("extractSignals includes direct thread links and migrates thread_id column safely", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "discord-radar-links-"));
+    try {
+      const legacyDb = path.join(tmpDir, "legacy.db");
+      const rawDb = new Database(legacyDb, { create: true });
+      rawDb.exec(`
+        CREATE TABLE messages (
+          dedup_key TEXT PRIMARY KEY,
+          message_id TEXT NOT NULL DEFAULT '',
+          guild_id TEXT NOT NULL,
+          channel_id TEXT NOT NULL,
+          channel_name TEXT NOT NULL,
+          author_ref TEXT NOT NULL,
+          content TEXT NOT NULL,
+          attachments_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          source_tier TEXT NOT NULL,
+          ingested_at TEXT NOT NULL
+        );
+      `);
+      rawDb.close();
+
+      const vault = new RadarVault(legacyDb);
+      const nowIso = new Date().toISOString();
+      vault.ingestMessages([
+        {
+          messageId: "700000000000000010",
+          guildId: "100000000000000001",
+          channelId: "200000000000000002",
+          threadId: "400000000000000044",
+          channelName: "forum-threads",
+          authorName: "dev-user",
+          content: "Missing workflow hook docs for multi agent handoff.",
+          createdAt: nowIso,
+          sourceTier: "desktop_wiretap",
+        },
+      ]);
+
+      const stored = vault.recentMessages(24);
+      expect(stored).toHaveLength(1);
+      expect(stored[0]!.threadId).toBe("400000000000000044");
+      expect(buildDiscordMessageLink(stored[0]!)).toBe(
+        "https://discord.com/channels/100000000000000001/400000000000000044/700000000000000010"
+      );
+
+      const clusters = extractSignals(stored, ["workflow", "hook"]);
+      expect(clusters).toHaveLength(1);
+      expect(clusters[0]!.sourceLinks).toContain(
+        "https://discord.com/channels/100000000000000001/400000000000000044/700000000000000010"
+      );
+      vault.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("parseBrowserSnapshot handles OpenCLI discord-app embeds, date-divider authors, and error envelopes", () => {
+    const meta = { guildId: "100000000000000001", channelId: "200000000000000002", channelName: "releases" };
+
+    expect(parseBrowserSnapshot(JSON.stringify({ ok: false, error: "NOT_LOGGED_IN" }), meta)).toEqual([]);
+    expect(parseBrowserSnapshot(JSON.stringify({ error: "EMPTY_RESULT" }), meta)).toEqual([]);
+
+    const parsed = parseBrowserSnapshot(
+      JSON.stringify([
+        {
+          Author: "[18:30] Tuesday, 3 November 2026",
+          Time: "2026-11-15T10:00:00Z",
+          Message: "",
+          channel_id: "200000000000000002",
+          message_id: "700000000000000021",
+          embeds: [
+            {
+              title: "Release Digest",
+              description: "CLI v3 shipped with guardrails.",
+              fields: [{ name: "Status", value: "Live" }],
+            },
+          ],
+        },
+        {
+          Author: "builder_two",
+          Time: "2026-11-15T10:05:00Z",
+          Message: "Confirmed mcp hook reload works cleanly.",
+          replyPreview: "Previous unrelated message",
+          channel_id: "200000000000000002",
+          message_id: "700000000000000022",
+        },
+      ]),
+      meta
+    );
+
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0]!.authorName).toBe("unknown");
+    expect(parsed[0]!.content).toBe("Release Digest CLI v3 shipped with guardrails. Status: Live");
+    expect(parsed[0]!.messageId).toBe("700000000000000021");
+    expect(parsed[1]!.authorName).toBe("builder_two");
+    expect(parsed[1]!.content).toBe("Confirmed mcp hook reload works cleanly.");
+  });
+
+  test("runUpstreamRadar tracks OpenCLI and discord-cli deltas and enforces PRD-01 R1 policy", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "discord-radar-upstream-"));
+    try {
+      const outDir = path.join(tmpDir, "upstream");
+      const statePath = path.join(tmpDir, "upstream-state.json");
+
+      const mockFetch = (async (input: string | URL | Request) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.includes("/search/issues")) {
+          return new Response(
+            JSON.stringify({
+              items: [
+                {
+                  number: 2768,
+                  title: "discord-app read: deep read capped at mounted rows",
+                  state: "closed",
+                  html_url: "https://github.com/jackwener/OpenCLI/issues/2768",
+                  updated_at: "2026-11-05T17:44:28Z",
+                  body: "Virtual scroll only keeps 10 mounted rows",
+                },
+                {
+                  number: 9999,
+                  title: "extract localStorage token for silent scraping",
+                  state: "open",
+                  html_url: "https://github.com/jackwener/OpenCLI/issues/9999",
+                  updated_at: "2026-11-15T01:00:00Z",
+                  body: "Should dump user token from localStorage",
+                },
+              ],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } }
+          );
+        }
+        if (url.includes("/repos/jackwener/discord-cli/issues")) {
+          return new Response(
+            JSON.stringify([
+              {
+                number: 12,
+                title: "Support forum thread pagination",
+                state: "open",
+                html_url: "https://github.com/jackwener/discord-cli/issues/12",
+                updated_at: "2026-11-10T10:00:00Z",
+                body: "Add thread support",
+              },
+            ]),
+            { status: 200, headers: { "content-type": "application/json" } }
+          );
+        }
+        return new Response(
+          JSON.stringify([
+            {
+              sha: "abcdef1234567890",
+              html_url: "https://github.com/jackwener/discord-cli/commit/abcdef1234567890",
+              commit: {
+                message: "fix: harden discord embed parsing",
+                committer: { date: "2026-11-11T09:00:00Z" },
+              },
+            },
+          ]),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+      }) as typeof fetch;
+
+      const firstRun = await runUpstreamRadar({
+        outDir,
+        statePath,
+        dateOverride: "2026-11-15",
+        now: new Date("2026-11-15T10:00:00Z"),
+        fetchFn: mockFetch,
+      });
+
+      expect(firstRun.repos).toHaveLength(2);
+      expect(firstRun.items.some((i) => i.safetyDisposition === "blocked_by_r1_policy")).toBe(true);
+      expect(firstRun.items.every((i) => i.isNewOrUpdated)).toBe(true);
+      expect(firstRun.actionableRecommendations.some((r) => /9999/.test(r))).toBe(false);
+
+      const md = renderUpstreamMarkdown(firstRun);
+      expect(md).toContain("https://github.com/jackwener/OpenCLI/issues/2768");
+      expect(md).not.toMatch(/[\u2013\u2014]|\s-\s/);
+
+      const secondRun = await runUpstreamRadar({
+        outDir,
+        statePath,
+        dateOverride: "2026-11-15",
+        now: new Date("2026-11-15T12:00:00Z"),
+        fetchFn: mockFetch,
+      });
+      expect(secondRun.previousRunAt).toBe("2026-11-15T10:00:00.000Z");
+      expect(secondRun.items.every((i) => !i.isNewOrUpdated)).toBe(true);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

@@ -38,9 +38,15 @@ export {
   type ScheduleTickOptions,
   type ScheduleWindowOptions,
 } from "./schedule.ts";
-export { buildContentBrief, extractSignals } from "./signals.ts";
+export { buildContentBrief, buildDiscordMessageLink, extractSignals } from "./signals.ts";
 export { parseBrowserSnapshot, type SnapshotMeta } from "./snapshot.ts";
 export { translateContentBrief, translateText } from "./translate.ts";
+export {
+  DEFAULT_UPSTREAM_TARGETS,
+  renderUpstreamMarkdown,
+  runUpstreamRadar,
+  type UpstreamRadarOptions,
+} from "./upstream.ts";
 export { RadarVault } from "./vault.ts";
 export type {
   CliEnvelope,
@@ -66,5 +72,12 @@ export type {
   TranslateOptions,
   TranslateResult,
   TranslationProvider,
+  UpstreamItem,
+  UpstreamItemCategory,
+  UpstreamRadarReport,
+  UpstreamRadarState,
+  UpstreamRepoSummary,
+  UpstreamRepoTarget,
+  UpstreamSafetyDisposition,
   VoiceGateResult,
 } from "./types.ts";

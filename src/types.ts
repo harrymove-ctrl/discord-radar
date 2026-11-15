@@ -30,6 +30,7 @@ export interface NormalizedMessage {
   messageId?: string;
   guildId: string;
   channelId: string;
+  threadId?: string;
   channelName?: string;
   authorId?: string;
   authorName: string;
@@ -45,6 +46,7 @@ export interface StoredMessage {
   messageId: string;
   guildId: string;
   channelId: string;
+  threadId?: string;
   channelName: string;
   authorRef: string;
   content: string;
@@ -70,6 +72,7 @@ export interface SignalCluster {
   matchedKeywords: string[];
   channelNames: string[];
   sampleSnippets: string[];
+  sourceLinks: string[];
   latestAt: string;
 }
 
@@ -142,6 +145,63 @@ export interface DemandDigestSection {
   brief: ContentBrief;
 }
 
+export type UpstreamItemCategory =
+  | "selector_resilience"
+  | "embed_and_reply_parsing"
+  | "forum_and_thread_sync"
+  | "typed_error_handling"
+  | "cli_contract_and_ux";
+
+export type UpstreamSafetyDisposition = "safe_engineering" | "blocked_by_r1_policy";
+
+export interface UpstreamRepoTarget {
+  repo: string;
+  query?: string;
+  trackMainCommits?: boolean;
+}
+
+export interface UpstreamItem {
+  repo: string;
+  kind: "issue" | "pull_request" | "commit";
+  ref: string;
+  title: string;
+  state: string;
+  url: string;
+  updatedAt: string;
+  isNewOrUpdated: boolean;
+  category: UpstreamItemCategory;
+  safetyDisposition: UpstreamSafetyDisposition;
+  localMappingHint: string;
+}
+
+export interface UpstreamRepoSummary {
+  repo: string;
+  status: "ok" | "rate_limited" | "error";
+  httpStatus?: number;
+  errorMessage?: string;
+  issueCount: number;
+  prCount: number;
+  commitCount: number;
+  newOrUpdatedCount: number;
+  blockedByR1Count: number;
+}
+
+export interface UpstreamRadarState {
+  lastRunAt: string;
+  seenItems: Record<string, string>;
+}
+
+export interface UpstreamRadarReport {
+  date: string;
+  generatedAt: string;
+  previousRunAt: string | null;
+  repos: UpstreamRepoSummary[];
+  items: UpstreamItem[];
+  actionableRecommendations: string[];
+  markdownPath: string;
+  jsonPath: string;
+}
+
 export interface DailyDigestReport {
   date: string;
   generatedAt: string;
@@ -152,6 +212,7 @@ export interface DailyDigestReport {
   previousDigestDate: string | null;
   ingest: InboxIngestReport;
   sections: DemandDigestSection[];
+  upstreamReport?: UpstreamRadarReport;
   markdownPath: string;
   jsonPath: string;
 }

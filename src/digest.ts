@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  anonymizeExternalText,
   checkVoiceGate,
   parseDiscordChannelUrl,
   scrubSnowflakeIds,
@@ -25,7 +26,10 @@ import type {
   SignalTrend,
   SourceTier,
   TracedSignalCluster,
+  UpstreamRadarReport,
+  UpstreamRepoTarget,
 } from "./types.ts";
+import { runUpstreamRadar } from "./upstream.ts";
 import { RadarVault } from "./vault.ts";
 
 export interface DigestOptions {
@@ -42,6 +46,10 @@ export interface DigestOptions {
   timeZone?: string;
   dateOverride?: string;
   autoIngest?: boolean;
+  includeUpstream?: boolean;
+  upstreamOutDir?: string;
+  upstreamStatePath?: string;
+  upstreamTargets?: UpstreamRepoTarget[];
   now?: Date;
   fetchFn?: typeof fetch;
 }
@@ -397,6 +405,7 @@ function readWiretapDatabaseRows(
         messageId: msgId || undefined,
         guildId: String(row.guild_id ?? "").trim(),
         channelId: effectiveChannelId,
+        ...(rawChannelId !== effectiveChannelId ? { threadId: rawChannelId } : {}),
         channelName: finalChannelName,
         authorId: typeof row.author_id === "string" ? row.author_id : undefined,
         authorName: String(row.author_name ?? "unknown"),
@@ -600,17 +609,32 @@ function renderDigestMarkdown(report: DailyDigestReport): string {
       lines.push("1. No matching topic signals detected in this window.", "");
     } else {
       lines.push(
-        "| Rank | Trend | Delta | Category | Topic | Posts | Channels |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
+        "| Rank | Trend | Delta | Category | Topic | Posts | Channels | Links |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
       );
       section.tracedSignals.forEach((sig, index) => {
         const channels = sig.channelNames.map((ch) => `\`${ch}\``).join(", ") || "`none`";
         const delta = `\`${formatDeltaBadge(sig.deltaCount)}\``;
+        const threadLinks =
+          sig.sourceLinks.length > 0
+            ? sig.sourceLinks.slice(0, 3).map((u, i) => `[Thread ${i + 1}](${u})`).join(", ")
+            : "`none`";
         lines.push(
-          `| ${index + 1} | \`${sig.trend}\` | ${delta} | \`${sig.category}\` | ${sig.title} | ${sig.messageCount} | ${channels} |`
+          `| ${index + 1} | \`${sig.trend}\` | ${delta} | \`${sig.category}\` | ${sig.title} | ${sig.messageCount} | ${channels} | ${threadLinks} |`
         );
       });
       lines.push("");
+
+      const allThreadUrls = Array.from(
+        new Set(section.tracedSignals.flatMap((sig) => sig.sourceLinks))
+      );
+      if (allThreadUrls.length > 0) {
+        lines.push("### Direct Discord Thread Links", "");
+        allThreadUrls.slice(0, 12).forEach((url, idx) => {
+          lines.push(`${idx + 1}. ${url}`);
+        });
+        lines.push("");
+      }
     }
 
     lines.push(
@@ -627,6 +651,30 @@ function renderDigestMarkdown(report: DailyDigestReport): string {
     );
   }
 
+  if (report.upstreamReport) {
+    lines.push("## Upstream CLI Radar (OpenCLI & discord-cli)", "");
+    lines.push(
+      "| Repository | Status | Issues | PRs | Main Commits | New or Updated | Blocked by R1 |",
+      "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
+    );
+    for (const repo of report.upstreamReport.repos) {
+      lines.push(
+        `| \`${repo.repo}\` | \`${repo.status}\` | ${repo.issueCount} | ${repo.prCount} | ${repo.commitCount} | ${repo.newOrUpdatedCount} | ${repo.blockedByR1Count} |`
+      );
+    }
+    lines.push("");
+    if (report.upstreamReport.items.length > 0) {
+      report.upstreamReport.items.slice(0, 12).forEach((item, idx) => {
+        const badge = item.isNewOrUpdated ? "[NEW/UPDATED]" : "[KNOWN]";
+        const r1 = item.safetyDisposition === "blocked_by_r1_policy" ? " [BLOCKED_BY_R1]" : "";
+        lines.push(
+          `${idx + 1}. ${badge}${r1} \`${item.repo}\` (${item.kind} \`${item.ref}\`): [${item.title}](${item.url}) (${item.localMappingHint})`
+        );
+      });
+      lines.push("");
+    }
+  }
+
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
@@ -639,6 +687,18 @@ export async function runDailyDigest(opts: DigestOptions = {}): Promise<DailyDig
   const dbPath = opts.dbPath?.trim() || process.env.RADAR_DB_PATH?.trim() || ".state/radar.db";
   const outDir = path.resolve(opts.outDir?.trim() || ".state/digests");
   ensurePrivateDir(outDir);
+
+  let upstreamReport: UpstreamRadarReport | undefined;
+  if (opts.includeUpstream) {
+    upstreamReport = await runUpstreamRadar({
+      targets: opts.upstreamTargets,
+      outDir: opts.upstreamOutDir,
+      statePath: opts.upstreamStatePath,
+      dateOverride: date,
+      now,
+      fetchFn: opts.fetchFn,
+    });
+  }
 
   const { demands } = loadDemandProfiles(opts.demandsFile ?? "");
   const effectiveDemands: DemandProfile[] =
@@ -744,6 +804,7 @@ export async function runDailyDigest(opts: DigestOptions = {}): Promise<DailyDig
       previousDigestDate,
       ingest,
       sections,
+      ...(upstreamReport ? { upstreamReport } : {}),
       markdownPath,
       jsonPath,
     };
@@ -1127,6 +1188,7 @@ export async function exportDemoPack(opts: DemoPackOptions = {}): Promise<DemoIn
         )
       ),
       sampleSnippets: cluster.sampleSnippets.map(clampDemoSnippet).filter(Boolean),
+      sourceLinks: [],
     }));
 
     let brief = buildContentBrief(sanitizedClusters, demandLabel, targetChannel);

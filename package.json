@@ -24,6 +24,7 @@
     "brief": "bun run src/cli.ts brief",
     "demo:pack": "bun run src/cli.ts demo-pack",
     "digest": "bun run src/cli.ts digest",
+    "upstream:radar": "bun run src/cli.ts upstream-radar",
     "schedule": "bun run src/cli.ts schedule",
     "schedule:install": "bun run src/cli.ts schedule --install-cron",
     "schedule:uninstall": "bun run src/cli.ts schedule --uninstall-cron",
