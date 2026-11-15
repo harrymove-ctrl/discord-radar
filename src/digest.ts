@@ -14,6 +14,7 @@ import { buildContentBrief, extractSignals } from "./signals.ts";
 import { parseBrowserSnapshot } from "./snapshot.ts";
 import { translateContentBrief } from "./translate.ts";
 import type {
+  CrawlCursor,
   DailyDigestReport,
   DemoChannelCoverage,
   DemoInsightsPack,
@@ -25,6 +26,7 @@ import type {
   SignalCluster,
   SignalTrend,
   SourceTier,
+  StoredMessage,
   TracedSignalCluster,
   UpstreamRadarReport,
   UpstreamRepoTarget,
@@ -40,6 +42,7 @@ export interface DigestOptions {
   wiretapConfigPath?: string;
   discrawlBin?: string;
   hours?: number;
+  onlyUncrawled?: boolean;
   lang?: string;
   fromLang?: string;
   pivotLang?: string;
@@ -52,6 +55,36 @@ export interface DigestOptions {
   upstreamTargets?: UpstreamRepoTarget[];
   now?: Date;
   fetchFn?: typeof fetch;
+}
+
+export interface WiretapIngestResult {
+  wiretapStatus: InboxIngestReport["wiretapStatus"];
+  scannedRows: number;
+  inserted: number;
+  insertedDedupKeys: string[];
+  skippedDuplicates: number;
+  quarantinedDmCount: number;
+  cursorRowid: number;
+  cursorReset: boolean;
+  cursorKey: string;
+}
+
+/** Build a stable cursor key scoped to the real wiretap SQLite path and subscribed sources. */
+export function buildWiretapCursorKey(
+  discrawlDbPath: string,
+  wiretapGuilds: string[],
+  wiretapChannels: string[]
+): string {
+  const realDb = fs.existsSync(discrawlDbPath)
+    ? fs.realpathSync(discrawlDbPath)
+    : path.resolve(discrawlDbPath);
+  const g = Array.from(new Set(wiretapGuilds.map((s) => s.trim()).filter(Boolean)))
+    .sort()
+    .join(",");
+  const c = Array.from(new Set(wiretapChannels.map((s) => s.trim()).filter(Boolean)))
+    .sort()
+    .join(",");
+  return `wiretap:${realDb}|g=${g}|c=${c}`;
 }
 
 export function resolveLocalTimeZone(explicit?: string): string {
@@ -260,20 +293,74 @@ function resolveDiscrawlDbPath(tomlBody: string, wiretapConfigPath: string): str
   return path.resolve(path.dirname(wiretapConfigPath), raw);
 }
 
-// Read discrawl SQLite tables directly in readonly mode so schema and parent threads match cleanly.
+interface WiretapReadResult {
+  rows: NormalizedMessage[];
+  scannedRows: number;
+  maxRowid: number;
+  maxUpdatedAt: string;
+  lastMessageId: string;
+  cursorReset: boolean;
+}
+
+// Read discrawl SQLite tables incrementally in readonly mode using persisted rowid/updated_at watermarks.
 function readWiretapDatabaseRows(
   discrawlDbPath: string,
   wiretapGuilds: string[],
-  wiretapChannels: string[]
-): NormalizedMessage[] {
-  if (!fs.existsSync(discrawlDbPath)) return [];
+  wiretapChannels: string[],
+  cursor?: CrawlCursor | null
+): WiretapReadResult {
+  if (!fs.existsSync(discrawlDbPath)) {
+    return {
+      rows: [],
+      scannedRows: 0,
+      maxRowid: 0,
+      maxUpdatedAt: "",
+      lastMessageId: "",
+      cursorReset: false,
+    };
+  }
   const extDb = new Database(discrawlDbPath);
   try {
     extDb.exec("PRAGMA query_only = ON;");
     const msgColRows = extDb.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
     const msgCols = new Set(msgColRows.map((c) => c.name));
     if (!msgCols.has("guild_id") || !msgCols.has("channel_id") || !msgCols.has("content")) {
-      return [];
+      return {
+        rows: [],
+        scannedRows: 0,
+        maxRowid: 0,
+        maxUpdatedAt: "",
+        lastMessageId: "",
+        cursorReset: false,
+      };
+    }
+
+    const hasUpdatedAt = msgCols.has("updated_at");
+    const metaSql = hasUpdatedAt
+      ? "SELECT COALESCE(MAX(rowid), 0) AS max_rowid, COALESCE(MAX(updated_at), '') AS max_updated_at FROM messages"
+      : "SELECT COALESCE(MAX(rowid), 0) AS max_rowid, '' AS max_updated_at FROM messages";
+    const metaRow = extDb.prepare(metaSql).get() as {
+      max_rowid: number;
+      max_updated_at: string;
+    };
+    const maxRowid = metaRow?.max_rowid ?? 0;
+    const maxUpdatedAt = metaRow?.max_updated_at ?? "";
+    const cursorReset = Boolean(cursor && maxRowid < cursor.lastRowid);
+
+    if (
+      cursor &&
+      !cursorReset &&
+      maxRowid === cursor.lastRowid &&
+      (!hasUpdatedAt || !cursor.lastUpdatedAt || maxUpdatedAt <= cursor.lastUpdatedAt)
+    ) {
+      return {
+        rows: [],
+        scannedRows: 0,
+        maxRowid,
+        maxUpdatedAt: maxUpdatedAt || cursor.lastUpdatedAt,
+        lastMessageId: cursor.lastMessageId,
+        cursorReset: false,
+      };
     }
 
     const chanColRows = extDb.prepare("PRAGMA table_info(channels)").all() as Array<{ name: string }>;
@@ -305,7 +392,19 @@ function readWiretapDatabaseRows(
     const hasThreadParentId = hasChannels && chanCols.has("thread_parent_id");
 
     const conditions = ["lower(m.guild_id) != '@me'", `trim(${contentExpr}) != ''`];
-    const params: string[] = [];
+    const params: Array<string | number> = [];
+
+    const effectiveLastRowid = cursorReset ? 0 : (cursor?.lastRowid ?? 0);
+    const effectiveLastUpdatedAt = cursorReset ? "" : (cursor?.lastUpdatedAt ?? "");
+    if (effectiveLastRowid > 0) {
+      if (hasUpdatedAt && effectiveLastUpdatedAt) {
+        conditions.push("(m.rowid > ? OR m.updated_at > ?)");
+        params.push(effectiveLastRowid, effectiveLastUpdatedAt);
+      } else {
+        conditions.push("m.rowid > ?");
+        params.push(effectiveLastRowid);
+      }
+    }
 
     if (wiretapGuilds.length > 0) {
       conditions.push(`m.guild_id IN (${wiretapGuilds.map(() => "?").join(", ")})`);
@@ -348,6 +447,7 @@ function readWiretapDatabaseRows(
 
     const sql = `
       SELECT
+        m.rowid AS _rowid,
         ${idExpr} AS message_id,
         m.guild_id AS guild_id,
         m.channel_id AS channel_id,
@@ -364,12 +464,11 @@ function readWiretapDatabaseRows(
       ${hasChannels ? "LEFT JOIN channels c ON c.id = m.channel_id" : ""}
       ${joinParent ? `LEFT JOIN channels pc ON pc.id = ${parentLookupExpr}` : ""}
       WHERE ${conditions.join(" AND ")}
-      ORDER BY created_at DESC
-      LIMIT 1000
+      ORDER BY m.rowid ASC
     `;
 
     const rawRows = extDb.prepare(sql).all(...params) as Array<Record<string, unknown>>;
-    return rawRows.map((row) => {
+    const rows: NormalizedMessage[] = rawRows.map((row) => {
       const threadParentId =
         typeof row.thread_parent_id === "string" ? row.thread_parent_id.trim() : "";
       const parentId = typeof row.parent_id === "string" ? row.parent_id.trim() : "";
@@ -415,8 +514,167 @@ function readWiretapDatabaseRows(
         sourceTier: "desktop_wiretap",
       };
     });
+
+    const lastMsg = rows.length > 0 ? rows[rows.length - 1]?.messageId ?? "" : "";
+    const lastMessageId = lastMsg || (cursorReset ? "" : (cursor?.lastMessageId ?? ""));
+    return {
+      rows,
+      scannedRows: rawRows.length,
+      maxRowid,
+      maxUpdatedAt,
+      lastMessageId,
+      cursorReset,
+    };
   } finally {
     extDb.close();
+  }
+}
+
+/** Run discrawl wiretap and ingest strictly uncrawled SQLite rows beyond the saved watermark. */
+export function ingestWiretapIncremental(
+  vault: RadarVault,
+  demands: DemandProfile[],
+  opts: {
+    wiretapConfigPath?: string;
+    discrawlBin?: string;
+    fullCache?: boolean;
+  } = {}
+): WiretapIngestResult {
+  const validSources = demands
+    .flatMap((d) => d.captureSources)
+    .filter((s) => !s.guildId.startsWith("REPLACE_") && !s.channelId.startsWith("REPLACE_"));
+
+  const wiretapConfigPath = path.resolve(
+    opts.wiretapConfigPath?.trim() ||
+      process.env.DISCRAWL_CONFIG?.trim() ||
+      "configs/discrawl-external-wiretap.local.toml"
+  );
+  const discrawlBin = opts.discrawlBin?.trim() || process.env.DISCRAWL_BIN?.trim() || "discrawl";
+  const hasDiscrawlBin = fs.existsSync(discrawlBin) || Boolean(Bun.which(discrawlBin));
+
+  if (!fs.existsSync(wiretapConfigPath) || !hasDiscrawlBin) {
+    return {
+      wiretapStatus: "skipped_not_configured",
+      scannedRows: 0,
+      inserted: 0,
+      insertedDedupKeys: [],
+      skippedDuplicates: 0,
+      quarantinedDmCount: 0,
+      cursorRowid: 0,
+      cursorReset: false,
+      cursorKey: "",
+    };
+  }
+
+  const wiretapSources = validSources.filter((s) => s.tier === "desktop_wiretap");
+  const wiretapGuilds = Array.from(
+    new Set(wiretapSources.map((s) => s.guildId.trim()).filter(Boolean))
+  );
+  const wiretapChannels = Array.from(
+    new Set(wiretapSources.map((s) => s.channelId.trim()).filter(Boolean))
+  );
+  const tomlBody = fs.readFileSync(wiretapConfigPath, "utf8");
+  if (wiretapGuilds.length === 0 && /REPLACE_/.test(tomlBody)) {
+    return {
+      wiretapStatus: "skipped_not_configured",
+      scannedRows: 0,
+      inserted: 0,
+      insertedDedupKeys: [],
+      skippedDuplicates: 0,
+      quarantinedDmCount: 0,
+      cursorRowid: 0,
+      cursorReset: false,
+      cursorKey: "",
+    };
+  }
+
+  try {
+    const discrawlDbPath = resolveDiscrawlDbPath(tomlBody, wiretapConfigPath);
+    ensurePrivateDir(path.dirname(discrawlDbPath));
+    const hadDbBefore = fs.existsSync(discrawlDbPath);
+    const spawnEnv = {
+      ...process.env,
+      DISCRAWL_NO_UPDATE_CHECK: "1",
+      DISCRAWL_NO_AUTO_UPDATE: "1",
+    };
+    const useFullCache = Boolean(opts.fullCache || !hadDbBefore);
+    const tapArgs = [
+      "--config",
+      wiretapConfigPath,
+      "wiretap",
+      ...(useFullCache ? ["--full-cache"] : []),
+    ];
+    const tap = spawnSync(discrawlBin, tapArgs, { encoding: "utf8", env: spawnEnv });
+    if (tap.status !== 0) {
+      return {
+        wiretapStatus: "failed",
+        scannedRows: 0,
+        inserted: 0,
+        insertedDedupKeys: [],
+        skippedDuplicates: 0,
+        quarantinedDmCount: 0,
+        cursorRowid: 0,
+        cursorReset: false,
+        cursorKey: "",
+      };
+    }
+
+    const cursorKey = buildWiretapCursorKey(discrawlDbPath, wiretapGuilds, wiretapChannels);
+    const prevCursor = opts.fullCache ? null : vault.getCrawlCursor(cursorKey);
+    const readRes = readWiretapDatabaseRows(
+      discrawlDbPath,
+      wiretapGuilds,
+      wiretapChannels,
+      prevCursor
+    );
+    const summary =
+      readRes.rows.length > 0
+        ? vault.ingestMessages(readRes.rows)
+        : {
+            inserted: 0,
+            insertedDedupKeys: [],
+            skippedDuplicates: 0,
+            quarantinedDmCount: 0,
+            rejectedAttachmentCount: 0,
+          };
+
+    if (
+      !prevCursor ||
+      readRes.cursorReset ||
+      readRes.maxRowid !== prevCursor.lastRowid ||
+      readRes.maxUpdatedAt !== prevCursor.lastUpdatedAt
+    ) {
+      vault.setCrawlCursor({
+        sourceKey: cursorKey,
+        lastRowid: readRes.maxRowid,
+        lastUpdatedAt: readRes.maxUpdatedAt,
+        lastMessageId: readRes.lastMessageId,
+      });
+    }
+
+    return {
+      wiretapStatus: "ingested",
+      scannedRows: readRes.scannedRows,
+      inserted: summary.inserted,
+      insertedDedupKeys: summary.insertedDedupKeys,
+      skippedDuplicates: summary.skippedDuplicates,
+      quarantinedDmCount: summary.quarantinedDmCount,
+      cursorRowid: readRes.maxRowid,
+      cursorReset: readRes.cursorReset,
+      cursorKey,
+    };
+  } catch {
+    return {
+      wiretapStatus: "failed",
+      scannedRows: 0,
+      inserted: 0,
+      insertedDedupKeys: [],
+      skippedDuplicates: 0,
+      quarantinedDmCount: 0,
+      cursorRowid: 0,
+      cursorReset: false,
+      cursorKey: "",
+    };
   }
 }
 
@@ -428,6 +686,7 @@ export function ingestPendingSources(
     inboxDir?: string;
     wiretapConfigPath?: string;
     discrawlBin?: string;
+    fullCache?: boolean;
   } = {}
 ): InboxIngestReport {
   const inboxDir = path.resolve(opts.inboxDir?.trim() || ".state/inbox");
@@ -446,6 +705,7 @@ export function ingestPendingSources(
     .sort((a, b) => a.localeCompare(b));
 
   const processedFiles: string[] = [];
+  const insertedDedupKeys: string[] = [];
   let inserted = 0;
   let skippedDuplicates = 0;
   let quarantinedDmCount = 0;
@@ -473,6 +733,7 @@ export function ingestPendingSources(
 
     const summary = vault.ingestMessages(items);
     inserted += summary.inserted;
+    insertedDedupKeys.push(...summary.insertedDedupKeys);
     skippedDuplicates += summary.skippedDuplicates;
     quarantinedDmCount += summary.quarantinedDmCount;
 
@@ -486,65 +747,27 @@ export function ingestPendingSources(
     processedFiles.push(fileName);
   }
 
-  let wiretapStatus: InboxIngestReport["wiretapStatus"] = "skipped_not_configured";
-  const wiretapConfigPath = path.resolve(
-    opts.wiretapConfigPath?.trim() ||
-      process.env.DISCRAWL_CONFIG?.trim() ||
-      "configs/discrawl-external-wiretap.local.toml"
-  );
-  const discrawlBin = opts.discrawlBin?.trim() || process.env.DISCRAWL_BIN?.trim() || "discrawl";
-  const hasDiscrawlBin = fs.existsSync(discrawlBin) || Boolean(Bun.which(discrawlBin));
+  const wiretap = ingestWiretapIncremental(vault, demands, {
+    wiretapConfigPath: opts.wiretapConfigPath,
+    discrawlBin: opts.discrawlBin,
+    fullCache: opts.fullCache,
+  });
 
-  if (fs.existsSync(wiretapConfigPath) && hasDiscrawlBin) {
-    const wiretapSources = validSources.filter((s) => s.tier === "desktop_wiretap");
-    const wiretapGuilds = Array.from(
-      new Set(wiretapSources.map((s) => s.guildId.trim()).filter(Boolean))
-    );
-    const wiretapChannels = Array.from(
-      new Set(wiretapSources.map((s) => s.channelId.trim()).filter(Boolean))
-    );
-    const tomlBody = fs.readFileSync(wiretapConfigPath, "utf8");
-    if (wiretapGuilds.length === 0 && /REPLACE_/.test(tomlBody)) {
-      wiretapStatus = "skipped_not_configured";
-    } else {
-      try {
-        const discrawlDbPath = resolveDiscrawlDbPath(tomlBody, wiretapConfigPath);
-        ensurePrivateDir(path.dirname(discrawlDbPath));
-        const hadDbBefore = fs.existsSync(discrawlDbPath);
-        const spawnEnv = {
-          ...process.env,
-          DISCRAWL_NO_UPDATE_CHECK: "1",
-          DISCRAWL_NO_AUTO_UPDATE: "1",
-        };
-        const tapArgs = [
-          "--config",
-          wiretapConfigPath,
-          "wiretap",
-          ...(hadDbBefore ? [] : ["--full-cache"]),
-        ];
-        const tap = spawnSync(discrawlBin, tapArgs, { encoding: "utf8", env: spawnEnv });
-        if (tap.status !== 0) {
-          wiretapStatus = "failed";
-        } else {
-          const rows = readWiretapDatabaseRows(discrawlDbPath, wiretapGuilds, wiretapChannels);
-          const summary = vault.ingestMessages(rows);
-          inserted += summary.inserted;
-          skippedDuplicates += summary.skippedDuplicates;
-          quarantinedDmCount += summary.quarantinedDmCount;
-          wiretapStatus = "ingested";
-        }
-      } catch {
-        wiretapStatus = "failed";
-      }
-    }
-  }
+  inserted += wiretap.inserted;
+  insertedDedupKeys.push(...wiretap.insertedDedupKeys);
+  skippedDuplicates += wiretap.skippedDuplicates;
+  quarantinedDmCount += wiretap.quarantinedDmCount;
 
   return {
     processedFiles,
     inserted,
+    insertedDedupKeys,
     skippedDuplicates,
     quarantinedDmCount,
-    wiretapStatus,
+    wiretapStatus: wiretap.wiretapStatus,
+    wiretapScannedRows: wiretap.scannedRows,
+    wiretapCursorRowid: wiretap.cursorRowid,
+    wiretapCursorReset: wiretap.cursorReset,
   };
 }
 
@@ -593,11 +816,14 @@ function formatDeltaBadge(deltaCount: number): string {
 }
 
 function renderDigestMarkdown(report: DailyDigestReport): string {
+  const scopeLine = report.onlyUncrawled
+    ? `2. **Crawl Scope**: \`uncrawled_only\` (\`${report.recentMessageCount}\` newly crawled messages out of \`${report.totalVaultMessages}\` archived; wiretap scanned \`${report.ingest.wiretapScannedRows ?? 0}\` rows, cursor \`rowid=${report.ingest.wiretapCursorRowid ?? 0}\`)`
+    : `2. **Lookback Window**: \`${report.hoursWindow}\` hours (\`${report.recentMessageCount}\` recent messages out of \`${report.totalVaultMessages}\` archived)`;
   const lines: string[] = [
     `# Discord Radar Daily Trace (\`${report.date}\`)`,
     "",
     `1. **Generated At**: \`${report.generatedAt}\` (\`${report.timeZone}\`)`,
-    `2. **Lookback Window**: \`${report.hoursWindow}\` hours (\`${report.recentMessageCount}\` recent messages out of \`${report.totalVaultMessages}\` archived)`,
+    scopeLine,
     `3. **Previous Baseline**: \`${report.previousDigestDate ?? "none"}\``,
     `4. **Inbox & Wiretap Ingest**: \`${report.ingest.processedFiles.length}\` inbox files, \`${report.ingest.inserted}\` new rows inserted, \`${report.ingest.skippedDuplicates}\` duplicates skipped, wiretap status \`${report.ingest.wiretapStatus}\``,
     "",
@@ -606,7 +832,12 @@ function renderDigestMarkdown(report: DailyDigestReport): string {
   for (const section of report.sections) {
     lines.push(`## ${section.demandLabel} (\`${section.targetChannel}\`)`, "");
     if (section.tracedSignals.length === 0) {
-      lines.push("1. No matching topic signals detected in this window.", "");
+      lines.push(
+        report.onlyUncrawled
+          ? "1. No matching new uncrawled topic signals detected in this run."
+          : "1. No matching topic signals detected in this window.",
+        ""
+      );
     } else {
       lines.push(
         "| Rank | Trend | Delta | Category | Topic | Posts | Channels | Links |",
@@ -684,6 +915,9 @@ export async function runDailyDigest(opts: DigestOptions = {}): Promise<DailyDig
   const now = opts.now ?? new Date();
   const date = opts.dateOverride?.trim() || getZonedNow(now, timeZone).dateStr;
   const hoursWindow = opts.hours ?? 24;
+  const onlyUncrawled =
+    opts.onlyUncrawled ??
+    (process.env.RADAR_ONLY_UNCRAWLED === "1" || process.env.RADAR_ONLY_UNCRAWLED === "true");
   const dbPath = opts.dbPath?.trim() || process.env.RADAR_DB_PATH?.trim() || ".state/radar.db";
   const outDir = path.resolve(opts.outDir?.trim() || ".state/digests");
   ensurePrivateDir(outDir);
@@ -695,6 +929,7 @@ export async function runDailyDigest(opts: DigestOptions = {}): Promise<DailyDig
       outDir: opts.upstreamOutDir,
       statePath: opts.upstreamStatePath,
       dateOverride: date,
+      onlyNew: onlyUncrawled,
       now,
       fetchFn: opts.fetchFn,
     });
@@ -723,6 +958,7 @@ export async function runDailyDigest(opts: DigestOptions = {}): Promise<DailyDig
         ? {
             processedFiles: [],
             inserted: 0,
+            insertedDedupKeys: [],
             skippedDuplicates: 0,
             quarantinedDmCount: 0,
             wiretapStatus: "skipped_not_configured",
@@ -733,7 +969,9 @@ export async function runDailyDigest(opts: DigestOptions = {}): Promise<DailyDig
             discrawlBin: opts.discrawlBin,
           });
 
-    const recentMessages = vault.recentMessages(hoursWindow, { limit: 500 });
+    const recentMessages = onlyUncrawled
+      ? vault.getMessagesByDedupKeys(ingest.insertedDedupKeys)
+      : vault.recentMessages(hoursWindow, { limit: 500 });
     const stats = vault.getStats();
     const sections: DemandDigestSection[] = [];
 
@@ -799,6 +1037,7 @@ export async function runDailyDigest(opts: DigestOptions = {}): Promise<DailyDig
       generatedAt: now.toISOString(),
       timeZone,
       hoursWindow,
+      onlyUncrawled,
       totalVaultMessages: stats.totalMessages,
       recentMessageCount: recentMessages.length,
       previousDigestDate,
@@ -1018,6 +1257,7 @@ export interface DemoPackOptions {
   channelIds?: string[];
   keywords?: string[];
   hours?: number;
+  onlyUncrawled?: boolean;
   lang?: string;
   fromLang?: string;
   pivotLang?: string;
@@ -1043,12 +1283,15 @@ function clampDemoSnippet(text: string): string {
 }
 
 function renderDemoPackMarkdown(pack: DemoInsightsPack): string {
+  const scopeLine = pack.onlyUncrawled
+    ? `3. **Crawl Scope**: \`uncrawled_only\` (\`${pack.totalMatchedMessages}\` newly matched messages)`
+    : `3. **Lookback Window**: \`${pack.hoursWindow}\` hours (\`${pack.totalMatchedMessages}\` matched messages)`;
   const lines: string[] = [
     `# Hackathon Demo Insights Pack (\`${pack.demandId}\`)`,
     "",
     `1. **Generated At**: \`${pack.generatedAt}\``,
     `2. **Topic Profile**: ${pack.demandLabel}`,
-    `3. **Lookback Window**: \`${pack.hoursWindow}\` hours (\`${pack.totalMatchedMessages}\` matched messages)`,
+    scopeLine,
     `4. **VoiceGate Status**: \`${pack.voiceGate.ok ? "pass" : "fail"}\` (\`maxConsecutiveOverlap=${pack.voiceGate.maxConsecutiveOverlap}\`)`,
     "",
     "## 1. Monitored Channel Coverage",
@@ -1132,7 +1375,17 @@ export async function exportDemoPack(opts: DemoPackOptions = {}): Promise<DemoIn
 
   const vault = new RadarVault(dbPath);
   try {
-    const recent = vault.recentMessages(hoursWindow, { limit: 1000 });
+    const demoCursorKey = `demo-pack:${demandId}`;
+    let demoCursorRowidToSave: number | null = null;
+    let recent: StoredMessage[];
+    if (opts.onlyUncrawled) {
+      const prevCursor = vault.getCrawlCursor(demoCursorKey);
+      const delta = vault.messagesAfterRowid(prevCursor?.lastRowid ?? 0, 1000);
+      recent = delta.messages;
+      demoCursorRowidToSave = delta.maxRowid;
+    } else {
+      recent = vault.recentMessages(hoursWindow, { limit: 1000 });
+    }
     const filtered = recent.filter((msg) => {
       if (msg.guildId.trim().toLowerCase() === "@me") return false;
       if (urlTargets.length > 0) {
@@ -1211,7 +1464,9 @@ export async function exportDemoPack(opts: DemoPackOptions = {}): Promise<DemoIn
     }
 
     const demoTalkingPoints: string[] = [
-      `Analyzed ${filtered.length} anonymized messages across ${channelCoverage.length} monitored channel(s) over the last ${hoursWindow} hours.`,
+      opts.onlyUncrawled
+        ? `Analyzed ${filtered.length} newly crawled anonymized messages across ${channelCoverage.length} monitored channel(s).`
+        : `Analyzed ${filtered.length} anonymized messages across ${channelCoverage.length} monitored channel(s) over the last ${hoursWindow} hours.`,
       sanitizedClusters.length > 0
         ? `Top signal cluster: ${sanitizedClusters[0]!.title} with ${sanitizedClusters[0]!.messageCount} posts across ${sanitizedClusters[0]!.channelNames.join(", ")}.`
         : "No channel messages matched this lookback window yet; scroll channels in Discord Desktop or add inbox snapshots and re-run.",
@@ -1228,6 +1483,7 @@ export async function exportDemoPack(opts: DemoPackOptions = {}): Promise<DemoIn
       demandLabel,
       generatedAt: new Date().toISOString(),
       hoursWindow,
+      onlyUncrawled: Boolean(opts.onlyUncrawled),
       totalMatchedMessages: filtered.length,
       channelCoverage,
       topSignals: sanitizedClusters,
@@ -1245,6 +1501,13 @@ export async function exportDemoPack(opts: DemoPackOptions = {}): Promise<DemoIn
 
     writePrivateFile(jsonPath, `${JSON.stringify(pack, null, 2)}\n`);
     writePrivateFile(markdownPath, renderDemoPackMarkdown(pack));
+    if (demoCursorRowidToSave !== null) {
+      vault.setCrawlCursor({
+        sourceKey: demoCursorKey,
+        lastRowid: demoCursorRowidToSave,
+        lastMessageId: recent[0]?.messageId ?? "",
+      });
+    }
     return pack;
   } finally {
     vault.close();

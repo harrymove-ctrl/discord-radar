@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { anonymizeExternalText, isQuarantinedDm, validateDiscordCdnUrl } from "./security.ts";
-import type { IngestSummary, NormalizedMessage, SourceTier, StoredMessage } from "./types.ts";
+import type { CrawlCursor, IngestSummary, NormalizedMessage, SourceTier, StoredMessage } from "./types.ts";
 
 interface MessageRow {
   dedup_key: string;
@@ -131,6 +131,14 @@ export class RadarVault {
         INSERT INTO messages_fts(rowid, content, channel_name)
         VALUES (new.rowid, new.content, new.channel_name);
       END;
+
+      CREATE TABLE IF NOT EXISTS crawl_cursors (
+        source_key TEXT PRIMARY KEY,
+        last_rowid INTEGER NOT NULL DEFAULT 0,
+        last_updated_at TEXT NOT NULL DEFAULT '',
+        last_message_id TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+      );
     `);
 
     const cols = this.db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
@@ -142,6 +150,7 @@ export class RadarVault {
   /** Ingest normalized messages across Bot, desktop cache wiretap, or browser snapshots. */
   ingestMessages(items: NormalizedMessage[]): IngestSummary {
     let inserted = 0;
+    const insertedDedupKeys: string[] = [];
     let skippedDuplicates = 0;
     let quarantinedDmCount = 0;
     let rejectedAttachmentCount = 0;
@@ -222,6 +231,7 @@ export class RadarVault {
 
         if (result.changes > 0) {
           inserted += 1;
+          insertedDedupKeys.push(dedupKey);
         } else {
           skippedDuplicates += 1;
         }
@@ -232,9 +242,131 @@ export class RadarVault {
 
     return {
       inserted,
+      insertedDedupKeys,
       skippedDuplicates,
       quarantinedDmCount,
       rejectedAttachmentCount,
+    };
+  }
+
+  /** Fetch specific newly ingested rows by their dedupKey values excluding @me DMs. */
+  getMessagesByDedupKeys(dedupKeys: string[]): StoredMessage[] {
+    const uniqueKeys = Array.from(new Set(dedupKeys.map((k) => k.trim()).filter(Boolean)));
+    if (uniqueKeys.length === 0) return [];
+
+    const out: StoredMessage[] = [];
+    const chunkSize = 400;
+    for (let i = 0; i < uniqueKeys.length; i += chunkSize) {
+      const chunk = uniqueKeys.slice(i, i + chunkSize);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `
+          SELECT m.*
+          FROM messages m
+          WHERE m.dedup_key IN (${placeholders}) AND lower(m.guild_id) != '@me'
+          `
+        )
+        .all(...chunk) as MessageRow[];
+      for (const row of rows) {
+        out.push(rowToStored(row));
+      }
+    }
+
+    return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  /** Fetch vault messages inserted after a given SQLite rowid watermark. */
+  messagesAfterRowid(
+    afterRowid: number,
+    limit = 1000
+  ): { messages: StoredMessage[]; maxRowid: number; cursorReset: boolean } {
+    const meta = this.db
+      .prepare("SELECT COALESCE(MAX(rowid), 0) AS max_rowid FROM messages")
+      .get() as { max_rowid: number };
+    const maxRowid = meta?.max_rowid ?? 0;
+    const cursorReset = afterRowid > 0 && maxRowid < afterRowid;
+    const effectiveAfter = cursorReset ? 0 : Math.max(0, afterRowid);
+    const rows = this.db
+      .prepare(
+        `
+        SELECT m.*
+        FROM messages m
+        WHERE m.rowid > ? AND lower(m.guild_id) != '@me'
+        ORDER BY m.created_at DESC
+        LIMIT ?
+        `
+      )
+      .all(effectiveAfter, Math.max(1, limit)) as MessageRow[];
+    return {
+      messages: rows.map(rowToStored),
+      maxRowid,
+      cursorReset,
+    };
+  }
+
+  /** Read a persisted incremental crawl watermark by source key. */
+  getCrawlCursor(sourceKey: string): CrawlCursor | null {
+    const row = this.db
+      .prepare(
+        `
+        SELECT source_key, last_rowid, last_updated_at, last_message_id, updated_at
+        FROM crawl_cursors
+        WHERE source_key = ?
+        `
+      )
+      .get(sourceKey) as
+      | {
+          source_key: string;
+          last_rowid: number;
+          last_updated_at: string;
+          last_message_id: string;
+          updated_at: string;
+        }
+      | undefined;
+
+    if (!row) return null;
+    return {
+      sourceKey: row.source_key,
+      lastRowid: row.last_rowid,
+      lastUpdatedAt: row.last_updated_at,
+      lastMessageId: row.last_message_id,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  /** Persist an updated incremental crawl watermark by source key. */
+  setCrawlCursor(input: {
+    sourceKey: string;
+    lastRowid: number;
+    lastUpdatedAt?: string;
+    lastMessageId?: string;
+  }): CrawlCursor {
+    const updatedAt = new Date().toISOString();
+    const lastUpdatedAt = (input.lastUpdatedAt ?? "").trim();
+    const lastMessageId = (input.lastMessageId ?? "").trim();
+    const lastRowid = Math.max(0, Math.floor(input.lastRowid));
+
+    this.db
+      .prepare(
+        `
+        INSERT INTO crawl_cursors (source_key, last_rowid, last_updated_at, last_message_id, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(source_key) DO UPDATE SET
+          last_rowid = excluded.last_rowid,
+          last_updated_at = excluded.last_updated_at,
+          last_message_id = excluded.last_message_id,
+          updated_at = excluded.updated_at
+        `
+      )
+      .run(input.sourceKey, lastRowid, lastUpdatedAt, lastMessageId, updatedAt);
+
+    return {
+      sourceKey: input.sourceKey,
+      lastRowid,
+      lastUpdatedAt,
+      lastMessageId,
+      updatedAt,
     };
   }
 

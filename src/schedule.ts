@@ -13,6 +13,7 @@ export interface ScheduleWindowOptions {
   windowStart?: string;
   windowEnd?: string;
   timeZone?: string;
+  intervalDays?: number;
   statePath?: string;
   now?: Date;
   dateOverride?: string;
@@ -84,12 +85,91 @@ function writePrivateStateFile(filePath: string, content: string): void {
   }
 }
 
+function parseDateUtcMs(dateStr: string): number {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr.trim());
+  if (!match) {
+    throw new Error(`Invalid YYYY-MM-DD date string "${dateStr}".`);
+  }
+  const year = Number.parseInt(match[1]!, 10);
+  const month = Number.parseInt(match[2]!, 10);
+  const day = Number.parseInt(match[3]!, 10);
+  return Date.UTC(year, month - 1, day);
+}
+
+/** Add whole calendar days to a YYYY-MM-DD date string in UTC calendar arithmetic. */
+export function addDaysToDateStr(dateStr: string, days: number): string {
+  const ms = parseDateUtcMs(dateStr) + Math.floor(days) * 86_400_000;
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function readExistingScheduleState(statePath: string): Partial<DailyScheduleState> | null {
+  if (!fs.existsSync(statePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(statePath, "utf8")) as Partial<DailyScheduleState>;
+  } catch {
+    return null;
+  }
+}
+
+function resolveLastCompletedDate(
+  existing: Partial<DailyScheduleState> | null,
+  statePath: string,
+  currentDateStr: string
+): string | null {
+  const candidates: string[] = [];
+  if (
+    existing?.completedAt &&
+    typeof existing.date === "string" &&
+    /^\d{4}-\d{2}-\d{2}$/.test(existing.date) &&
+    existing.date <= currentDateStr
+  ) {
+    candidates.push(existing.date);
+  }
+  if (
+    typeof existing?.lastCompletedDate === "string" &&
+    /^\d{4}-\d{2}-\d{2}$/.test(existing.lastCompletedDate) &&
+    existing.lastCompletedDate <= currentDateStr
+  ) {
+    candidates.push(existing.lastCompletedDate);
+  }
+
+  const historyPath = path.join(path.dirname(statePath), "schedule-history.jsonl");
+  if (fs.existsSync(historyPath)) {
+    try {
+      const lines = fs.readFileSync(historyPath, "utf8").split(/\r?\n/);
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const parsed = JSON.parse(trimmed) as { date?: unknown };
+          if (
+            typeof parsed.date === "string" &&
+            /^\d{4}-\d{2}-\d{2}$/.test(parsed.date) &&
+            parsed.date <= currentDateStr
+          ) {
+            candidates.push(parsed.date);
+          }
+        } catch {
+          // Skip malformed history rows cleanly
+        }
+      }
+    } catch {
+      // Ignore unreadable history log
+    }
+  }
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.localeCompare(a));
+  return candidates[0] ?? null;
+}
+
 function resolveWindowSettings(opts: ScheduleWindowOptions): {
   timeZone: string;
   normStart: string;
   normEnd: string;
   startMinute: number;
   endMinute: number;
+  intervalDays: number;
   statePath: string;
 } {
   const timeZone = resolveLocalTimeZone(opts.timeZone);
@@ -102,39 +182,69 @@ function resolveWindowSettings(opts: ScheduleWindowOptions): {
       `Schedule windowStart (${start.normalized}) must be strictly earlier than windowEnd (${end.normalized}).`
     );
   }
+  const envInterval = Number.parseInt(process.env.RADAR_INTERVAL_DAYS?.trim() || "", 10);
+  const rawInterval =
+    typeof opts.intervalDays === "number" && Number.isFinite(opts.intervalDays)
+      ? opts.intervalDays
+      : Number.isFinite(envInterval)
+        ? envInterval
+        : 2;
+  const intervalDays = Math.max(1, Math.floor(rawInterval));
   return {
     timeZone,
     normStart: start.normalized,
     normEnd: end.normalized,
     startMinute: start.minuteOfDay,
     endMinute: end.minuteOfDay,
+    intervalDays,
     statePath: path.resolve(opts.statePath?.trim() || ".state/schedule-state.json"),
   };
 }
 
-/** Load or initialize today's random crawl slot inside the configured window. */
+/** Load or initialize today's random crawl slot inside the configured window and interval. */
 export function ensureDailyScheduleState(opts: ScheduleWindowOptions = {}): DailyScheduleState {
-  const { timeZone, normStart, normEnd, startMinute, endMinute, statePath } =
+  const { timeZone, normStart, normEnd, startMinute, endMinute, intervalDays, statePath } =
     resolveWindowSettings(opts);
   const now = opts.now ?? new Date();
   const dateStr = opts.dateOverride?.trim() || getZonedNow(now, timeZone).dateStr;
+  const existing = readExistingScheduleState(statePath);
+  const lastCompletedDate = resolveLastCompletedDate(existing, statePath, dateStr);
+  const nextEligibleDate = lastCompletedDate
+    ? addDaysToDateStr(lastCompletedDate, intervalDays)
+    : dateStr;
 
-  if (fs.existsSync(statePath)) {
-    try {
-      const existing = JSON.parse(fs.readFileSync(statePath, "utf8")) as Partial<DailyScheduleState>;
-      if (
-        existing.date === dateStr &&
-        existing.timeZone === timeZone &&
-        existing.windowStart === normStart &&
-        existing.windowEnd === normEnd &&
-        typeof existing.targetMinute === "number" &&
-        typeof existing.targetTime === "string"
-      ) {
-        return existing as DailyScheduleState;
-      }
-    } catch {
-      // Regenerate clean state if corrupted
+  if (
+    existing &&
+    existing.date === dateStr &&
+    existing.timeZone === timeZone &&
+    existing.windowStart === normStart &&
+    existing.windowEnd === normEnd &&
+    typeof existing.targetMinute === "number" &&
+    typeof existing.targetTime === "string"
+  ) {
+    if (
+      existing.intervalDays === intervalDays &&
+      existing.lastCompletedDate === lastCompletedDate &&
+      existing.nextEligibleDate === nextEligibleDate
+    ) {
+      return existing as DailyScheduleState;
     }
+    const upgraded: DailyScheduleState = {
+      date: existing.date,
+      timeZone: existing.timeZone,
+      windowStart: existing.windowStart,
+      windowEnd: existing.windowEnd,
+      intervalDays,
+      targetMinute: existing.targetMinute,
+      targetTime: existing.targetTime,
+      lastCompletedDate,
+      nextEligibleDate,
+      completedAt: existing.completedAt ?? null,
+      lastDigestMarkdownPath: existing.lastDigestMarkdownPath ?? null,
+      lastDigestJsonPath: existing.lastDigestJsonPath ?? null,
+    };
+    writePrivateStateFile(statePath, `${JSON.stringify(upgraded, null, 2)}\n`);
+    return upgraded;
   }
 
   const targetMinute = pickDailyTargetMinute(startMinute, endMinute, opts.rng);
@@ -143,8 +253,11 @@ export function ensureDailyScheduleState(opts: ScheduleWindowOptions = {}): Dail
     timeZone,
     windowStart: normStart,
     windowEnd: normEnd,
+    intervalDays,
     targetMinute,
     targetTime: formatMinuteOfDay(targetMinute),
+    lastCompletedDate,
+    nextEligibleDate,
     completedAt: null,
     lastDigestMarkdownPath: null,
     lastDigestJsonPath: null,
@@ -153,7 +266,7 @@ export function ensureDailyScheduleState(opts: ScheduleWindowOptions = {}): Dail
   return fresh;
 }
 
-/** Simulate random daily crawl slots over the next N days within the window. */
+/** Simulate random crawl slots over upcoming eligible days within the window and interval. */
 export function previewRandomScheduleDays(
   days: number,
   opts: ScheduleWindowOptions = {}
@@ -162,14 +275,18 @@ export function previewRandomScheduleDays(
   timeZone: string;
   windowStart: string;
   windowEnd: string;
+  intervalDays: number;
   targetMinute: number;
   targetTime: string;
 }> {
-  const { timeZone, normStart, normEnd, startMinute, endMinute } = resolveWindowSettings(opts);
+  const { timeZone, normStart, normEnd, startMinute, endMinute, intervalDays, statePath } =
+    resolveWindowSettings(opts);
   const now = opts.now ?? new Date();
   const startDate = opts.dateOverride?.trim() || getZonedNow(now, timeZone).dateStr;
-  const [y, m, d] = startDate.split("-").map((v) => Number.parseInt(v, 10));
-  const baseMs = Date.UTC(y!, (m! || 1) - 1, d! || 1);
+  const existing = readExistingScheduleState(statePath);
+  const lastCompleted = resolveLastCompletedDate(existing, statePath, startDate);
+  const nextEligible = lastCompleted ? addDaysToDateStr(lastCompleted, intervalDays) : startDate;
+  const anchorDate = nextEligible > startDate ? nextEligible : startDate;
   const count = Math.max(1, Math.min(31, days));
 
   const out: Array<{
@@ -177,18 +294,20 @@ export function previewRandomScheduleDays(
     timeZone: string;
     windowStart: string;
     windowEnd: string;
+    intervalDays: number;
     targetMinute: number;
     targetTime: string;
   }> = [];
 
   for (let offset = 0; offset < count; offset += 1) {
-    const dateStr = new Date(baseMs + offset * 86_400_000).toISOString().slice(0, 10);
+    const dateStr = addDaysToDateStr(anchorDate, offset * intervalDays);
     const targetMinute = pickDailyTargetMinute(startMinute, endMinute, opts.rng);
     out.push({
       date: dateStr,
       timeZone,
       windowStart: normStart,
       windowEnd: normEnd,
+      intervalDays,
       targetMinute,
       targetTime: formatMinuteOfDay(targetMinute),
     });
@@ -196,7 +315,7 @@ export function previewRandomScheduleDays(
   return out;
 }
 
-/** Check whether the current time matches today's randomized slot and run once per day. */
+/** Check whether today is eligible on the cadence and inside the randomized window. */
 export async function runScheduleTick(
   opts: ScheduleTickOptions = {}
 ): Promise<ScheduleTickResult> {
@@ -226,6 +345,14 @@ export async function runScheduleTick(
         state,
       };
     }
+    if (state.nextEligibleDate && zoned.dateStr < state.nextEligibleDate) {
+      return {
+        action: "cooldown_interval",
+        nowDate: zoned.dateStr,
+        nowTime: zoned.timeStr,
+        state,
+      };
+    }
     if (zoned.minuteOfDay < state.targetMinute) {
       return {
         action: "waiting_for_slot",
@@ -238,14 +365,18 @@ export async function runScheduleTick(
 
   const digest = await runDailyDigest({
     ...opts.digestOpts,
+    onlyUncrawled: opts.digestOpts?.onlyUncrawled ?? true,
     timeZone,
     dateOverride: zoned.dateStr,
     now,
   });
 
   const completedAt = now.toISOString();
+  const nextEligibleDate = addDaysToDateStr(zoned.dateStr, state.intervalDays);
   const updatedState: DailyScheduleState = {
     ...state,
+    lastCompletedDate: zoned.dateStr,
+    nextEligibleDate,
     completedAt,
     lastDigestMarkdownPath: digest.markdownPath,
     lastDigestJsonPath: digest.jsonPath,
@@ -256,6 +387,8 @@ export async function runScheduleTick(
   const historyRow = JSON.stringify({
     date: updatedState.date,
     timeZone: updatedState.timeZone,
+    intervalDays: updatedState.intervalDays,
+    nextEligibleDate: updatedState.nextEligibleDate,
     targetTime: updatedState.targetTime,
     executedAt: completedAt,
     executedLocalTime: zoned.timeStr,
@@ -283,14 +416,15 @@ export async function runScheduleTick(
 
 /** Build the 5 minute polling cron entry restricted to the active hour range. */
 export function buildCronEntry(opts: CronInstallOptions = {}): string {
-  const { timeZone, normStart, normEnd, startMinute, endMinute } = resolveWindowSettings(opts);
+  const { timeZone, normStart, normEnd, startMinute, endMinute, intervalDays } =
+    resolveWindowSettings(opts);
   const startHour = Math.floor(startMinute / 60);
   const endHour = Math.floor(endMinute / 60);
   const repoRoot = path.resolve(opts.repoRoot?.trim() || process.cwd());
   const bunPath = opts.bunPath?.trim() || process.execPath;
   const logPath = path.join(repoRoot, ".state", "schedule.log");
 
-  return `*/5 ${startHour}-${endHour} * * * cd "${repoRoot}" && "${bunPath}" run src/cli.ts schedule --tick --window-start ${normStart} --window-end ${normEnd} --tz "${timeZone}" >> "${logPath}" 2>&1 ${CRON_TAG}`;
+  return `*/5 ${startHour}-${endHour} * * * cd "${repoRoot}" && "${bunPath}" run src/cli.ts schedule --tick --interval-days ${intervalDays} --only-new --window-start ${normStart} --window-end ${normEnd} --tz "${timeZone}" >> "${logPath}" 2>&1 ${CRON_TAG}`;
 }
 
 function readCurrentCrontab(): string[] {

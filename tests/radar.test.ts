@@ -880,6 +880,344 @@ describe("discord-radar safety and signal pipeline", () => {
       });
       expect(secondRun.previousRunAt).toBe("2026-11-15T10:00:00.000Z");
       expect(secondRun.items.every((i) => !i.isNewOrUpdated)).toBe(true);
+
+      const thirdRunOnlyNew = await runUpstreamRadar({
+        outDir,
+        statePath,
+        dateOverride: "2026-11-15",
+        onlyNew: true,
+        now: new Date("2026-11-15T13:00:00Z"),
+        fetchFn: mockFetch,
+      });
+      expect(thirdRunOnlyNew.items).toEqual([]);
+      expect(thirdRunOnlyNew.actionableRecommendations).toEqual([]);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("enforces every 2 days cooldown cadence alongside randomized window slots and force override", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "discord-radar-2day-"));
+    try {
+      const statePath = path.join(tmpDir, "schedule-state.json");
+      const dbPath = path.join(tmpDir, "radar.db");
+      const inboxDir = path.join(tmpDir, "inbox");
+      const outDir = path.join(tmpDir, "digests");
+      const demandsFile = path.join(tmpDir, "demands.json");
+      const missingWiretap = path.join(tmpDir, "missing-wiretap.toml");
+      fs.writeFileSync(demandsFile, "[]");
+
+      let slotMinute = 10 * 60;
+      const baseOpts = {
+        windowStart: "08:00",
+        windowEnd: "18:00",
+        timeZone: "Asia/Ho_Chi_Minh",
+        intervalDays: 2,
+        statePath,
+        rng: () => slotMinute,
+        digestOpts: {
+          dbPath,
+          outDir,
+          inboxDir,
+          demandsFile,
+          wiretapConfigPath: missingWiretap,
+          onlyUncrawled: true,
+        },
+      };
+
+      const day0Exec = await runScheduleTick({
+        ...baseOpts,
+        now: new Date("2026-11-15T10:05:00+07:00"),
+      });
+      expect(day0Exec.action).toBe("executed");
+      expect(day0Exec.state.intervalDays).toBe(2);
+      expect(day0Exec.state.lastCompletedDate).toBe("2026-11-15");
+      expect(day0Exec.state.nextEligibleDate).toBe("2026-11-17");
+
+      slotMinute = 9 * 60;
+      const day1Cooldown = await runScheduleTick({
+        ...baseOpts,
+        now: new Date("2026-11-16T15:00:00+07:00"),
+      });
+      expect(day1Cooldown.action).toBe("cooldown_interval");
+      expect(day1Cooldown.digest).toBeUndefined();
+      expect(day1Cooldown.state.nextEligibleDate).toBe("2026-11-17");
+      expect(fs.existsSync(path.join(outDir, "2026-11-16.md"))).toBe(false);
+
+      slotMinute = 11 * 60;
+      const day2Waiting = await runScheduleTick({
+        ...baseOpts,
+        now: new Date("2026-11-17T08:30:00+07:00"),
+      });
+      expect(day2Waiting.action).toBe("waiting_for_slot");
+      expect(day2Waiting.state.targetTime).toBe("11:00");
+
+      const day2Exec = await runScheduleTick({
+        ...baseOpts,
+        now: new Date("2026-11-17T11:05:00+07:00"),
+      });
+      expect(day2Exec.action).toBe("executed");
+      expect(day2Exec.state.lastCompletedDate).toBe("2026-11-17");
+      expect(day2Exec.state.nextEligibleDate).toBe("2026-11-19");
+
+      slotMinute = 9 * 60;
+      const day3Cooldown = await runScheduleTick({
+        ...baseOpts,
+        now: new Date("2026-11-18T12:00:00+07:00"),
+      });
+      expect(day3Cooldown.action).toBe("cooldown_interval");
+
+      const day3Forced = await runScheduleTick({
+        ...baseOpts,
+        force: true,
+        now: new Date("2026-11-18T12:05:00+07:00"),
+      });
+      expect(day3Forced.action).toBe("executed");
+      expect(day3Forced.state.lastCompletedDate).toBe("2026-11-18");
+      expect(day3Forced.state.nextEligibleDate).toBe("2026-11-20");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("ingests and digests strictly uncrawled wiretap rows across runs and handles db reset", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "discord-radar-incr-"));
+    try {
+      const dbPath = path.join(tmpDir, "radar.db");
+      const extDbPath = path.join(tmpDir, "discrawl-ext.db");
+      const inboxDir = path.join(tmpDir, "inbox");
+      const outDir = path.join(tmpDir, "digests");
+      const upstreamOutDir = path.join(tmpDir, "upstream");
+      const upstreamStatePath = path.join(tmpDir, "upstream-state.json");
+      const demoOutDir = path.join(tmpDir, "demo-packs");
+      const demandsFile = path.join(tmpDir, "demands.local.json");
+      const wiretapToml = path.join(tmpDir, "wiretap.local.toml");
+
+      fs.writeFileSync(
+        wiretapToml,
+        `db_path = ${JSON.stringify(extDbPath)}\ndefault_guild_id = "100000000000000001"\nguild_ids = ["100000000000000001"]\n`
+      );
+      upsertLocalCaptureSources({
+        demandsFile,
+        wiretapConfigPath: wiretapToml,
+        demandId: "inc-demo",
+        label: "Incremental Signal Suite",
+        urls: ["https://discord.com/channels/100000000000000001/200000000000000002"],
+        keywords: ["remotion", "mcp"],
+        ownedTargetChannel: "#demo-feed",
+      });
+
+      const createExtDb = () => {
+        const db = new Database(extDbPath, { create: true });
+        db.exec(`
+          CREATE TABLE channels (
+            id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            parent_id TEXT,
+            thread_parent_id TEXT,
+            kind TEXT NOT NULL DEFAULT 'text'
+          );
+          CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            author_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            normalized_content TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+        `);
+        db.prepare(
+          "INSERT INTO channels (id, guild_id, name, parent_id, thread_parent_id, kind) VALUES (?, ?, ?, ?, ?, ?)"
+        ).run("200000000000000002", "100000000000000001", "general-help", null, null, "text");
+        return db;
+      };
+
+      const extDb1 = createExtDb();
+      try {
+        const ins = extDb1.prepare(
+          "INSERT INTO messages (id, guild_id, channel_id, author_id, content, normalized_content, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        );
+        ins.run(
+          "700000000000000101",
+          "100000000000000001",
+          "200000000000000002",
+          "500000000000000001",
+          "Why does remotion audio sync crash during export?",
+          "Why does remotion audio sync crash during export?",
+          "2026-11-15T06:00:00Z",
+          "2026-11-15T06:00:00Z"
+        );
+        ins.run(
+          "700000000000000102",
+          "100000000000000001",
+          "200000000000000002",
+          "500000000000000002",
+          "Recurring mcp hook reload error on startup",
+          "Recurring mcp hook reload error on startup",
+          "2026-11-15T06:05:00Z",
+          "2026-11-15T06:05:00Z"
+        );
+      } finally {
+        extDb1.close();
+      }
+
+      const mockFetch = (async (input: string | URL | Request) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.includes("/search/issues")) {
+          return new Response(
+            JSON.stringify({
+              items: [
+                {
+                  number: 2768,
+                  title: "discord-app read: deep read capped at mounted rows",
+                  state: "open",
+                  html_url: "https://github.com/jackwener/OpenCLI/issues/2768",
+                  updated_at: "2026-11-15T05:00:00Z",
+                  body: "Virtual scroll only keeps mounted rows",
+                },
+              ],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } }
+          );
+        }
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch;
+
+      const commonDigestOpts = {
+        dbPath,
+        outDir,
+        inboxDir,
+        demandsFile,
+        wiretapConfigPath: wiretapToml,
+        discrawlBin: "/usr/bin/true",
+        onlyUncrawled: true,
+        includeUpstream: true,
+        upstreamOutDir,
+        upstreamStatePath,
+        fetchFn: mockFetch,
+      };
+
+      const run1 = await runDailyDigest({
+        ...commonDigestOpts,
+        dateOverride: "2026-11-15",
+      });
+      expect(run1.onlyUncrawled).toBe(true);
+      expect(run1.ingest.wiretapScannedRows).toBe(2);
+      expect(run1.ingest.inserted).toBe(2);
+      expect(run1.ingest.wiretapCursorRowid).toBe(2);
+      expect(run1.recentMessageCount).toBe(2);
+      expect(run1.upstreamReport?.items).toHaveLength(1);
+
+      const pack1 = await exportDemoPack({
+        dbPath,
+        demandsFile,
+        outDir: demoOutDir,
+        demandId: "inc-demo",
+        onlyUncrawled: true,
+      });
+      expect(pack1.onlyUncrawled).toBe(true);
+      expect(pack1.totalMatchedMessages).toBe(2);
+
+      // Run 2: 0 new rows must scan 0 rows and emit 0 duplicate signals.
+      const run2 = await runDailyDigest({
+        ...commonDigestOpts,
+        dateOverride: "2026-11-17",
+      });
+      expect(run2.ingest.wiretapScannedRows).toBe(0);
+      expect(run2.ingest.inserted).toBe(0);
+      expect(run2.recentMessageCount).toBe(0);
+      expect(run2.sections[0]?.tracedSignals).toEqual([]);
+      expect(run2.upstreamReport?.items).toEqual([]);
+
+      const pack2 = await exportDemoPack({
+        dbPath,
+        demandsFile,
+        outDir: demoOutDir,
+        demandId: "inc-demo",
+        onlyUncrawled: true,
+      });
+      expect(pack2.totalMatchedMessages).toBe(0);
+
+      // Run 3: append 1 new row and verify only that 1 uncrawled row is scanned and digested.
+      const extDb2 = new Database(extDbPath);
+      try {
+        extDb2
+          .prepare(
+            "INSERT INTO messages (id, guild_id, channel_id, author_id, content, normalized_content, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+          )
+          .run(
+            "700000000000000103",
+            "100000000000000001",
+            "200000000000000002",
+            "500000000000000003",
+            "How should we avoid mcp timeout on long thread queues?",
+            "How should we avoid mcp timeout on long thread queues?",
+            "2026-11-19T06:00:00Z",
+            "2026-11-19T06:00:00Z"
+          );
+      } finally {
+        extDb2.close();
+      }
+
+      const run3 = await runDailyDigest({
+        ...commonDigestOpts,
+        dateOverride: "2026-11-19",
+      });
+      expect(run3.ingest.wiretapScannedRows).toBe(1);
+      expect(run3.ingest.inserted).toBe(1);
+      expect(run3.ingest.wiretapCursorRowid).toBe(3);
+      expect(run3.recentMessageCount).toBe(1);
+      expect(run3.totalVaultMessages).toBe(3);
+      expect(run3.sections[0]?.tracedSignals).toHaveLength(1);
+      expect(run3.sections[0]?.tracedSignals[0]?.messageCount).toBe(1);
+
+      const pack3 = await exportDemoPack({
+        dbPath,
+        demandsFile,
+        outDir: demoOutDir,
+        demandId: "inc-demo",
+        onlyUncrawled: true,
+      });
+      expect(pack3.totalMatchedMessages).toBe(1);
+
+      // Run 4: recreate external DB (max_rowid drops from 3 to 1) and verify automatic cursor reset.
+      fs.rmSync(extDbPath, { force: true });
+      const extDbReset = createExtDb();
+      try {
+        extDbReset
+          .prepare(
+            "INSERT INTO messages (id, guild_id, channel_id, author_id, content, normalized_content, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+          )
+          .run(
+            "700000000000000104",
+            "100000000000000001",
+            "200000000000000002",
+            "500000000000000004",
+            "Comparing mcp bridge latency after remotion v4 upgrade",
+            "Comparing mcp bridge latency after remotion v4 upgrade",
+            "2026-11-21T06:00:00Z",
+            "2026-11-21T06:00:00Z"
+          );
+      } finally {
+        extDbReset.close();
+      }
+
+      const run4 = await runDailyDigest({
+        ...commonDigestOpts,
+        dateOverride: "2026-11-21",
+      });
+      expect(run4.ingest.wiretapCursorReset).toBe(true);
+      expect(run4.ingest.wiretapScannedRows).toBe(1);
+      expect(run4.ingest.inserted).toBe(1);
+      expect(run4.ingest.wiretapCursorRowid).toBe(1);
+      expect(run4.recentMessageCount).toBe(1);
+      expect(run4.totalVaultMessages).toBe(4);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

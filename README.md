@@ -39,10 +39,10 @@ bun run doctor --json
 
 2. Edit `configs/demands.local.json` with your topic keywords, source guild or channel IDs, and target channels inside your own server. Every `*.local.*` file stays untracked in [`.gitignore`](./.gitignore).
 
-3. Import external discussions passively from your local Discord Desktop cache (`Tier 2`):
+3. Import only newly cached external discussions passively from your local Discord Desktop cache (`Tier 2`, tracked via `crawl_cursors` in `.state/radar.db`):
 
 ```zsh
-bash scripts/crawl-wiretap.sh configs/discrawl-external-wiretap.local.toml TARGET_EXTERNAL_GUILD_ID
+bash scripts/crawl-wiretap.sh configs/discrawl-external-wiretap.local.toml
 ```
 
 4. Or import a browser tab snapshot captured via `OpenCLI` (`opencli browser state --source ax`) or Chrome DevTools MCP (`take_snapshot`):
@@ -89,22 +89,22 @@ bun run translate --text "Your draft text here" --from en --to en --pivot vi --j
 
 4. **Cloud API Key Optional**: Unset `GOOGLE_TRANSLATE_API_KEY` uses the keyless `translate.googleapis.com` `gtx` endpoint by default; setting `GOOGLE_TRANSLATE_API_KEY` in `.env` upgrades requests cleanly to Google Cloud Translation v2.
 
-## 4. Daily Content Tracing & Randomized Window Automation
+## 4. Incremental Content Tracing & Every 2 Days Window Automation
 
-Discord Radar tracks how community discussions change day over day without running at the same clock minute every morning:
+Discord Radar tracks new community discussions every 2 days inside a randomized daytime window without re-scanning already indexed rows:
 
-1. **Snapshot Drop Folder (`.state/inbox/`)**: Drop `.json`, `.jsonl`, or `.txt` browser snapshots into `.state/inbox/` (optionally named `<guildId>__<channelId>__<channelName>.json` or matching a configured `channelName`). Every `digest` run ingests queued files, triggers passive local `discrawl` cache extraction when configured, and archives processed files under `.state/inbox/processed/`.
-2. **Delta Signal Tracing (`digest`)**: `bun run digest` compares today's clusters against the newest prior `YYYY-MM-DD.json` report in `.state/digests/`, tagging every topic as `new`, `rising`, `steady`, or `cooling` with exact post count deltas, direct `https://discord.com/channels/...` thread links, and a `voiceGate` checked Markdown summary:
+1. **Snapshot Drop Folder (`.state/inbox/`)**: Drop `.json`, `.jsonl`, or `.txt` browser snapshots into `.state/inbox/` (optionally named `<guildId>__<channelId>__<channelName>.json` or matching a configured `channelName`). Every `digest` run ingests queued files, runs `ingestWiretapIncremental` using persisted `crawl_cursors` (`last_rowid` and `last_updated_at`) so previously crawled messages are skipped, and archives processed files under `.state/inbox/processed/`.
+2. **Incremental Digest Tracing (`digest --only-new`)**: `bun run digest --only-new --with-upstream` restricts signal extraction, content briefs, and upstream GitHub reporting strictly to newly crawled messages and new or updated upstream items since the previous crawl, tagging topics as `new`, `rising`, `steady`, or `cooling` against `.state/digests/`.
 
 ```zsh
-bun run digest --with-upstream --lang vi --json
+bun run digest --only-new --with-upstream --lang vi --json
 ```
 
-3. **Daily Randomized Execution Window (`schedule`)**: Instead of hitting the same fixed minute each day, `src/schedule.ts` picks one random minute per calendar day inside `--window-start` (`08:00`) through `--window-end` (`18:00`) in your local timezone. Polling every 5 minutes via cron checks `.state/schedule-state.json`, executes `digest` once when the random slot arrives, logs runs into `.state/schedule.log`, and records daily history in `.state/schedule-history.jsonl`:
+3. **Every 2 Days Randomized Execution Window (`schedule`)**: Instead of hitting the same clock minute or running daily, `src/schedule.ts` enforces `--interval-days 2` (configurable via `RADAR_INTERVAL_DAYS`) and picks one random minute on each eligible day between `--window-start` (`08:00`) and `--window-end` (`18:00`) in your local timezone. Polling every 5 minutes via cron checks `.state/schedule-state.json`, returns `cooldown_interval` at zero LLM cost on off days, executes `digest --only-new` once when the random slot arrives, updates `nextEligibleDate`, and appends `.state/schedule-history.jsonl`:
 
 ```zsh
-bun run schedule --preview-days 5 --window-start 08:00 --window-end 18:00 --json
-bun run schedule --install-cron --window-start 08:00 --window-end 18:00 --tz Asia/Ho_Chi_Minh --json
+bun run schedule --preview-days 5 --interval-days 2 --window-start 08:00 --window-end 18:00 --json
+bun run schedule --install-cron --interval-days 2 --window-start 08:00 --window-end 18:00 --tz Asia/Ho_Chi_Minh --json
 ```
 
 4. **Channel URL Wiring (`source:add`) & Demo Insights Pack (`demo:pack`)**: Paste full Discord channel URLs (from servers you follow as a member) directly without editing IDs by hand. Discord Radar saves the parsed IDs into gitignored `configs/demands.local.json`, updates your local wiretap TOML, reads Forum threads automatically, scrubs all Discord Snowflake IDs (`[id]`), and verifies `checkVoiceGate` before writing `.state/demo-packs/<demand>.{md,json}`:
@@ -136,16 +136,17 @@ All commands support `--json` and emit `{ ok, schema_version, data | error }` au
 | `doctor` | Verify DB path, `DISCORD_BOT_TOKEN` Bot prefix format, `discrawl` binary, and active demand config | `--db`, `--demands-file`, `--json` |
 | `targets` | Display active topic profiles loaded from `configs/demands.local.json` or `configs/demands.example.json` | `--demands-file`, `--json` |
 | `add-source` | Register full Discord channel URLs into gitignored local demand and wiretap configs | `--url`, `--demand`, `--label`, `--keywords`, `--target-channel` |
+| `ingest-wiretap` | Run `discrawl wiretap` and ingest only uncrawled SQLite rows beyond `crawl_cursors` | `--wiretap-config`, `--full-cache`, `--demands-file`, `--db` |
 | `ingest-snapshot` | Parse browser JSON (including `OpenCLI` `discord-app` embed/reply cards), accessibility trees, or timestamped logs into SQLite | `--file`, `--url`, `--guild`, `--channel`, `--channel-name`, `--db` |
 | `ingest-jsonl` | Import JSONL message streams from `discrawl` SQL queries or Bot exporters | `--file`, `--tier`, `--guild`, `--channel`, `--db` |
 | `today` | List archived messages from the last `N` hours excluding quarantined `@me` DMs | `--hours`, `--url`, `--guild`, `--channel`, `--limit`, `--db` |
 | `search` | Run BM25 ranked SQLite FTS5 full text search across stored discussions | `<query>`, `--url`, `--guild`, `--channel`, `--limit`, `--db` |
 | `signals` | Cluster questions, recurring bugs, feature requests, and comparisons with direct thread deep links | `--demand`, `--url`, `--keywords`, `--hours`, `--demands-file` |
 | `brief` | Generate a headline, outline, and `voiceGate` checked draft starter with optional `--lang` / `--pivot` translation | `--demand`, `--url`, `--target-channel`, `--lang`, `--pivot`, `--from` |
-| `demo-pack` | Export Snowflake scrubbed, anonymized, `voiceGate` checked insights Markdown and JSON for demos | `--demand`, `--url`, `--hours`, `--out-dir`, `--lang`, `--pivot` |
-| `digest` | Ingest `.state/inbox/` + configured wiretap, trace day over day topic deltas with thread links, and write `.state/digests/YYYY-MM-DD.{md,json}` | `--hours`, `--with-upstream`, `--inbox-dir`, `--out-dir`, `--lang`, `--pivot` |
-| `upstream-radar` | Track `jackwener/OpenCLI` and `jackwener/discord-cli` issues, PRs, and `main` commits into `.state/upstream/latest.{md,json}` | `--repos`, `--limit`, `--out-dir`, `--state-file`, `--json` |
-| `schedule` | Pick one random daily run minute inside `08:00` to `18:00`, inspect upcoming slots, run ticks, or install crontab | `--install-cron`, `--preview-days`, `--tick`, `--with-upstream`, `--window-start`, `--window-end`, `--tz` |
+| `demo-pack` | Export Snowflake scrubbed, anonymized, `voiceGate` checked insights Markdown and JSON for demos | `--demand`, `--url`, `--hours`, `--only-new`, `--out-dir`, `--lang`, `--pivot` |
+| `digest` | Ingest `.state/inbox/` + incremental wiretap, trace topic deltas with thread links, and write `.state/digests/YYYY-MM-DD.{md,json}` | `--hours`, `--only-new`, `--with-upstream`, `--inbox-dir`, `--out-dir`, `--lang`, `--pivot` |
+| `upstream-radar` | Track `jackwener/OpenCLI` and `jackwener/discord-cli` issues, PRs, and `main` commits into `.state/upstream/latest.{md,json}` | `--repos`, `--limit`, `--only-new`, `--out-dir`, `--state-file`, `--json` |
+| `schedule` | Enforce `--interval-days 2` cadence, pick one random run minute inside `08:00` to `18:00`, inspect slots, run ticks, or install crontab | `--install-cron`, `--interval-days`, `--preview-days`, `--tick`, `--with-upstream`, `--window-start`, `--window-end`, `--tz` |
 | `translate` | Translate or back translate drafts with protected code/links/channels plus `stripContentSlop` and `checkVoiceGate` | `--text`, `--file`, `--to`, `--from`, `--pivot` |
 | `voice-check` | Validate drafts against AI filler phrases, zero width Unicode, HTML tags, dash slop, and verbatim overlap | `--draft`, `--file` |
 

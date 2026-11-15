@@ -16,6 +16,7 @@
   "scripts": {
     "doctor": "bun run src/cli.ts doctor",
     "targets": "bun run src/cli.ts targets",
+    "ingest:wiretap": "bun run src/cli.ts ingest-wiretap",
     "ingest:snapshot": "bun run src/cli.ts ingest-snapshot",
     "ingest:jsonl": "bun run src/cli.ts ingest-jsonl",
     "today": "bun run src/cli.ts today",

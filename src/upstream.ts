@@ -17,6 +17,7 @@ export interface UpstreamRadarOptions {
   outDir?: string;
   statePath?: string;
   dateOverride?: string;
+  onlyNew?: boolean;
   now?: Date;
   fetchFn?: typeof fetch;
 }
@@ -157,7 +158,7 @@ export function renderUpstreamMarkdown(report: UpstreamRadarReport): string {
 
   lines.push("## 2. Tracked Discord Issues, Pull Requests & Main Commits", "");
   if (report.items.length === 0) {
-    lines.push("1. No upstream items were retrieved in this run.", "");
+    lines.push("1. No new or updated upstream items detected in this crawl.", "");
   } else {
     report.items.forEach((item, idx) => {
       const deltaBadge = item.isNewOrUpdated ? "[NEW/UPDATED]" : "[KNOWN]";
@@ -353,9 +354,11 @@ export async function runUpstreamRadar(
     repos.push(repoSummary);
   }
 
+  const visibleItems = opts.onlyNew ? items.filter((i) => i.isNewOrUpdated) : items;
+
   const actionableRecommendations = Array.from(
     new Set(
-      items
+      visibleItems
         .filter((i) => i.safetyDisposition === "safe_engineering")
         .map((i) => `${i.localMappingHint} (${i.repo} ${i.ref})`)
     )
@@ -371,7 +374,7 @@ export async function runUpstreamRadar(
     generatedAt: now.toISOString(),
     previousRunAt: prevState.lastRunAt || null,
     repos,
-    items,
+    items: visibleItems,
     actionableRecommendations,
     markdownPath,
     jsonPath,

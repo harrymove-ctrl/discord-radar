@@ -8,7 +8,8 @@ Read [`README.md`](./README.md) and [`docs/requirements/README.md`](./docs/requi
 2. **Strict `@me` DM Quarantine**: Always tag and skip `@me`, `dm`, and `direct_message` rows before inserting into SQLite or running signal queries.
 3. **Attachment SSRF Boundary**: Allow external attachment URLs only over `https://` port `443` matching `cdn.discordapp.com`, `media.discordapp.net`, or `images-ext-<digits>.discordapp.net` without credentials or IP literals.
 4. **External Anonymization, Translation & VoiceGate**: Automatically replace external member names and `@mentions` with deterministic labels (`Participant_N`) during `desktop_wiretap` and `browser_snapshot` ingestion, strip AI slop during translation in [`src/translate.ts`](./src/translate.ts), and validate drafts with `checkVoiceGate` before publishing to owned channels.
-5. **Secret Hygiene**: Keep `.env`, `.state/`, `.cache/`, `vault/`, `captures/`, `configs/*.local.json`, `configs/*.local.toml`, and `*.db` files gitignored. Never commit guild IDs, tokens, or captured chat exports.
+5. **Incremental Watermarks & 2 Day Cadence**: Scheduled `discrawl` wiretap crawls run once every `2` days (`intervalDays: 2`) inside `08:00` to `18:00` using persisted SQLite `crawl_cursors` (`rowid` and `updated_at`) so only previously uncrawled rows are ingested and summarized when `onlyUncrawled` is active.
+6. **Secret Hygiene**: Keep `.env`, `.state/`, `.cache/`, `vault/`, `captures/`, `configs/*.local.json`, `configs/*.local.toml`, and `*.db` files gitignored. Never commit guild IDs, tokens, or captured chat exports.
 
 ## 2. Writing & Git Hygiene Gate
 

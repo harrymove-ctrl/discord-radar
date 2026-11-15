@@ -56,8 +56,17 @@ export interface StoredMessage {
   ingestedAt: string;
 }
 
+export interface CrawlCursor {
+  sourceKey: string;
+  lastRowid: number;
+  lastUpdatedAt: string;
+  lastMessageId: string;
+  updatedAt: string;
+}
+
 export interface IngestSummary {
   inserted: number;
+  insertedDedupKeys: string[];
   skippedDuplicates: number;
   quarantinedDmCount: number;
   rejectedAttachmentCount: number;
@@ -132,9 +141,13 @@ export interface TracedSignalCluster extends SignalCluster {
 export interface InboxIngestReport {
   processedFiles: string[];
   inserted: number;
+  insertedDedupKeys: string[];
   skippedDuplicates: number;
   quarantinedDmCount: number;
   wiretapStatus: "ingested" | "skipped_not_configured" | "failed";
+  wiretapScannedRows?: number;
+  wiretapCursorRowid?: number;
+  wiretapCursorReset?: boolean;
 }
 
 export interface DemandDigestSection {
@@ -207,6 +220,7 @@ export interface DailyDigestReport {
   generatedAt: string;
   timeZone: string;
   hoursWindow: number;
+  onlyUncrawled?: boolean;
   totalVaultMessages: number;
   recentMessageCount: number;
   previousDigestDate: string | null;
@@ -222,15 +236,23 @@ export interface DailyScheduleState {
   timeZone: string;
   windowStart: string;
   windowEnd: string;
+  intervalDays: number;
   targetMinute: number;
   targetTime: string;
+  lastCompletedDate: string | null;
+  nextEligibleDate: string | null;
   completedAt: string | null;
   lastDigestMarkdownPath: string | null;
   lastDigestJsonPath: string | null;
 }
 
 export interface ScheduleTickResult {
-  action: "executed" | "waiting_for_slot" | "outside_window" | "already_completed_today";
+  action:
+    | "executed"
+    | "waiting_for_slot"
+    | "outside_window"
+    | "already_completed_today"
+    | "cooldown_interval";
   nowDate: string;
   nowTime: string;
   state: DailyScheduleState;
@@ -254,6 +276,7 @@ export interface DemoInsightsPack {
   demandLabel: string;
   generatedAt: string;
   hoursWindow: number;
+  onlyUncrawled?: boolean;
   totalMatchedMessages: number;
   channelCoverage: DemoChannelCoverage[];
   topSignals: SignalCluster[];

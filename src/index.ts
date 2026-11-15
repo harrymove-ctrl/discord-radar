@@ -13,6 +13,7 @@ export {
 export {
   exportDemoPack,
   ingestPendingSources,
+  ingestWiretapIncremental,
   loadDemandProfiles,
   parseJsonlMessages,
   resolveDemandsPath,
@@ -21,8 +22,10 @@ export {
   type DemoPackOptions,
   type DigestOptions,
   type UpsertSourceOptions,
+  type WiretapIngestResult,
 } from "./digest.ts";
 export {
+  addDaysToDateStr,
   buildCronEntry,
   ensureDailyScheduleState,
   formatMinuteOfDay,
@@ -51,6 +54,7 @@ export { RadarVault } from "./vault.ts";
 export type {
   CliEnvelope,
   ContentBrief,
+  CrawlCursor,
   DailyDigestReport,
   DailyScheduleState,
   DemoChannelCoverage,

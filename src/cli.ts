@@ -8,6 +8,7 @@ import {
 } from "./security.ts";
 import {
   exportDemoPack,
+  ingestWiretapIncremental,
   loadDemandProfiles,
   parseJsonlMessages,
   runDailyDigest,
@@ -60,7 +61,9 @@ interface CliOptions {
   windowStart: string;
   windowEnd: string;
   timeZone: string;
+  intervalDays: number;
   stateFile: string;
+  wiretapConfigPath: string;
   repos: string[];
   tick: boolean;
   force: boolean;
@@ -69,6 +72,8 @@ interface CliOptions {
   installCron: boolean;
   uninstallCron: boolean;
   noIngest: boolean;
+  onlyNew: boolean;
+  fullCache: boolean;
   withUpstream: boolean;
   positionals: string[];
 }
@@ -103,7 +108,12 @@ function parseFlags(argv: string[]): { command: string; opts: CliOptions } {
     windowStart: process.env.RADAR_WINDOW_START?.trim() || "08:00",
     windowEnd: process.env.RADAR_WINDOW_END?.trim() || "18:00",
     timeZone: process.env.RADAR_TIMEZONE?.trim() || "",
+    intervalDays: Math.max(
+      1,
+      Number.parseInt(process.env.RADAR_INTERVAL_DAYS?.trim() || "", 10) || 2
+    ),
     stateFile: "",
+    wiretapConfigPath: "",
     repos: [],
     tick: false,
     force: false,
@@ -112,6 +122,10 @@ function parseFlags(argv: string[]): { command: string; opts: CliOptions } {
     installCron: false,
     uninstallCron: false,
     noIngest: false,
+    onlyNew:
+      process.env.RADAR_ONLY_UNCRAWLED === "1" ||
+      process.env.RADAR_ONLY_UNCRAWLED === "true",
+    fullCache: false,
     withUpstream: false,
     positionals: [],
   };
@@ -125,6 +139,8 @@ function parseFlags(argv: string[]): { command: string; opts: CliOptions } {
     else if (arg === "--install-cron") opts.installCron = true;
     else if (arg === "--uninstall-cron") opts.uninstallCron = true;
     else if (arg === "--no-ingest") opts.noIngest = true;
+    else if (arg === "--only-new" || arg === "--incremental") opts.onlyNew = true;
+    else if (arg === "--full-cache") opts.fullCache = true;
     else if (arg === "--with-upstream") opts.withUpstream = true;
     else if (arg === "--repos" && argv[i + 1]) {
       opts.repos = argv[++i]!
@@ -188,6 +204,10 @@ function parseFlags(argv: string[]): { command: string; opts: CliOptions } {
       opts.windowEnd = argv[++i]!;
     } else if (arg === "--tz" && argv[i + 1]) {
       opts.timeZone = argv[++i]!;
+    } else if (arg === "--interval-days" && argv[i + 1]) {
+      opts.intervalDays = Math.max(1, Number.parseInt(argv[++i]!, 10) || 2);
+    } else if (arg === "--wiretap-config" && argv[i + 1]) {
+      opts.wiretapConfigPath = argv[++i]!;
     } else if (arg === "--state-file" && argv[i + 1]) {
       opts.stateFile = argv[++i]!;
     } else if (arg === "--preview-days" && argv[i + 1]) {
@@ -266,6 +286,7 @@ async function run(): Promise<void> {
         channelIds: opts.urls.length === 0 && opts.channelId ? [opts.channelId] : undefined,
         keywords: opts.keywords.length > 0 ? opts.keywords : undefined,
         hours: opts.hasExplicitHours ? opts.hours : undefined,
+        onlyUncrawled: opts.onlyNew,
         lang: opts.lang || undefined,
         fromLang: opts.fromLang,
         pivotLang: opts.pivotLang || undefined,
@@ -398,6 +419,7 @@ async function run(): Promise<void> {
         limit: opts.limit === 50 ? 8 : opts.limit,
         outDir: opts.outDir || undefined,
         statePath: opts.stateFile || undefined,
+        onlyNew: opts.onlyNew,
       });
       emit(opts, { ok: true, schema_version: "1", data: report });
       return;
@@ -409,7 +431,9 @@ async function run(): Promise<void> {
         outDir: opts.outDir || undefined,
         inboxDir: opts.inboxDir || undefined,
         demandsFile: opts.demandsFile,
+        wiretapConfigPath: opts.wiretapConfigPath || undefined,
         hours: opts.hours,
+        onlyUncrawled: opts.onlyNew,
         lang: opts.lang || undefined,
         fromLang: opts.fromLang,
         pivotLang: opts.pivotLang || undefined,
@@ -432,6 +456,7 @@ async function run(): Promise<void> {
           windowStart: opts.windowStart,
           windowEnd: opts.windowEnd,
           timeZone: opts.timeZone || undefined,
+          intervalDays: opts.intervalDays,
           statePath: opts.stateFile || undefined,
         });
         emit(opts, { ok: true, schema_version: "1", data: res });
@@ -442,6 +467,8 @@ async function run(): Promise<void> {
           windowStart: opts.windowStart,
           windowEnd: opts.windowEnd,
           timeZone: opts.timeZone || undefined,
+          intervalDays: opts.intervalDays,
+          statePath: opts.stateFile || undefined,
         });
         emit(opts, { ok: true, schema_version: "1", data: { count: slots.length, slots } });
         return;
@@ -451,6 +478,7 @@ async function run(): Promise<void> {
           windowStart: opts.windowStart,
           windowEnd: opts.windowEnd,
           timeZone: opts.timeZone || undefined,
+          intervalDays: opts.intervalDays,
           statePath: opts.stateFile || undefined,
           force: opts.force,
           digestOpts: {
@@ -458,7 +486,9 @@ async function run(): Promise<void> {
             outDir: opts.outDir || undefined,
             inboxDir: opts.inboxDir || undefined,
             demandsFile: opts.demandsFile,
+            wiretapConfigPath: opts.wiretapConfigPath || undefined,
             hours: opts.hours,
+            onlyUncrawled: true,
             lang: opts.lang || undefined,
             fromLang: opts.fromLang,
             pivotLang: opts.pivotLang || undefined,
@@ -474,6 +504,7 @@ async function run(): Promise<void> {
         windowStart: opts.windowStart,
         windowEnd: opts.windowEnd,
         timeZone: opts.timeZone || undefined,
+        intervalDays: opts.intervalDays,
         statePath: opts.stateFile || undefined,
       });
       emit(opts, { ok: true, schema_version: "1", data: state });
@@ -481,6 +512,30 @@ async function run(): Promise<void> {
     }
 
     vault = new RadarVault(opts.dbPath);
+
+    if (command === "ingest-wiretap") {
+      const { demands } = loadDemandProfiles(opts.demandsFile);
+      const res = ingestWiretapIncremental(vault, demands, {
+        wiretapConfigPath: opts.wiretapConfigPath || undefined,
+        fullCache: opts.fullCache,
+      });
+      const ok = res.wiretapStatus !== "failed";
+      emit(opts, {
+        ok,
+        schema_version: "1",
+        data: res,
+        ...(ok
+          ? {}
+          : {
+              error: {
+                code: "wiretap_failed",
+                message: "discrawl wiretap exited with non zero status.",
+              },
+            }),
+      });
+      if (!ok) process.exitCode = 1;
+      return;
+    }
 
     if (command === "ingest-snapshot") {
       if (!opts.file || !opts.guildId || !opts.channelId) {
@@ -592,7 +647,7 @@ async function run(): Promise<void> {
       error: {
         code: "unknown_command",
         message: `Unknown command "${command}".`,
-        hint: "Use doctor, targets, add-source, ingest-snapshot, ingest-jsonl, today, search, signals, brief, demo-pack, digest, schedule, upstream-radar, translate, or voice-check.",
+        hint: "Use doctor, targets, add-source, ingest-wiretap, ingest-snapshot, ingest-jsonl, today, search, signals, brief, demo-pack, digest, schedule, upstream-radar, translate, or voice-check.",
       },
     });
     process.exitCode = 1;
