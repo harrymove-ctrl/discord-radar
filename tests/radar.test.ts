@@ -570,7 +570,8 @@ describe("discord-radar safety and signal pipeline", () => {
             guild_id TEXT NOT NULL,
             name TEXT NOT NULL,
             parent_id TEXT,
-            thread_parent_id TEXT
+            thread_parent_id TEXT,
+            kind TEXT NOT NULL DEFAULT 'text'
           );
           CREATE TABLE messages (
             id TEXT PRIMARY KEY,
@@ -585,14 +586,17 @@ describe("discord-radar safety and signal pipeline", () => {
 
         const nowIso = new Date(Date.now() - 5 * 60_000).toISOString();
         extDb
-          .prepare("INSERT INTO channels (id, guild_id, name, parent_id, thread_parent_id) VALUES (?, ?, ?, ?, ?)")
-          .run("200000000000000002", "100000000000000001", "general-help", null, null);
+          .prepare("INSERT INTO channels (id, guild_id, name, parent_id, thread_parent_id, kind) VALUES (?, ?, ?, ?, ?, ?)")
+          .run("200000000000000002", "100000000000000001", "general-help", null, null, "text");
         extDb
-          .prepare("INSERT INTO channels (id, guild_id, name, parent_id, thread_parent_id) VALUES (?, ?, ?, ?, ?)")
-          .run("300000000000000003", "100000000000000001", "bug-forum", null, null);
+          .prepare("INSERT INTO channels (id, guild_id, name, parent_id, thread_parent_id, kind) VALUES (?, ?, ?, ?, ?, ?)")
+          .run("300000000000000003", "100000000000000001", "bug-forum", null, null, "forum");
         extDb
-          .prepare("INSERT INTO channels (id, guild_id, name, parent_id, thread_parent_id) VALUES (?, ?, ?, ?, ?)")
-          .run("400000000000000004", "100000000000000001", "mcp-timeout-thread", "300000000000000003", "300000000000000003");
+          .prepare("INSERT INTO channels (id, guild_id, name, parent_id, thread_parent_id, kind) VALUES (?, ?, ?, ?, ?, ?)")
+          .run("400000000000000004", "100000000000000001", "mcp-timeout-thread", "300000000000000003", "300000000000000003", "thread_public");
+        extDb
+          .prepare("INSERT INTO channels (id, guild_id, name, parent_id, thread_parent_id, kind) VALUES (?, ?, ?, ?, ?, ?)")
+          .run("450000000000000005", "100000000000000001", "Agent workflow hook tips", null, null, "thread_public");
 
         const insMsg = extDb.prepare(
           "INSERT INTO messages (id, guild_id, channel_id, author_id, content, normalized_content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
@@ -633,6 +637,15 @@ describe("discord-radar safety and signal pipeline", () => {
           "Unrelated channel chatter outside subscribed channels",
           nowIso
         );
+        insMsg.run(
+          "700000000000000005",
+          "100000000000000001",
+          "450000000000000005",
+          "500000000000000005",
+          "Sharing our mcp hook setup notes for community feedback.",
+          "Sharing our mcp hook setup notes for community feedback.",
+          nowIso
+        );
       } finally {
         extDb.close();
       }
@@ -646,7 +659,7 @@ describe("discord-radar safety and signal pipeline", () => {
           discrawlBin: "/usr/bin/true",
         });
         expect(ingest.wiretapStatus).toBe("ingested");
-        expect(ingest.inserted).toBe(2);
+        expect(ingest.inserted).toBe(3);
         expect(vault.searchMessages("Private DM")).toHaveLength(0);
         expect(vault.searchMessages("Unrelated")).toHaveLength(0);
       } finally {
@@ -661,7 +674,7 @@ describe("discord-radar safety and signal pipeline", () => {
         hours: 24,
       });
 
-      expect(pack.totalMatchedMessages).toBe(2);
+      expect(pack.totalMatchedMessages).toBe(3);
       expect(pack.voiceGate.ok).toBe(true);
       expect(pack.channelCoverage.length).toBeGreaterThanOrEqual(2);
 

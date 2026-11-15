@@ -259,8 +259,9 @@ function readWiretapDatabaseRows(
   wiretapChannels: string[]
 ): NormalizedMessage[] {
   if (!fs.existsSync(discrawlDbPath)) return [];
-  const extDb = new Database(discrawlDbPath, { readonly: true });
+  const extDb = new Database(discrawlDbPath);
   try {
+    extDb.exec("PRAGMA query_only = ON;");
     const msgColRows = extDb.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
     const msgCols = new Set(msgColRows.map((c) => c.name));
     if (!msgCols.has("guild_id") || !msgCols.has("channel_id") || !msgCols.has("content")) {
@@ -291,6 +292,7 @@ function readWiretapDatabaseRows(
         : "'unknown'";
     const hasChannels = chanCols.has("id");
     const hasChannelName = hasChannels && chanCols.has("name");
+    const hasKind = hasChannels && chanCols.has("kind");
     const hasParentId = hasChannels && chanCols.has("parent_id");
     const hasThreadParentId = hasChannels && chanCols.has("thread_parent_id");
 
@@ -315,6 +317,16 @@ function readWiretapDatabaseRows(
         channelClauses.push(`c.thread_parent_id IN (${chPh})`);
         params.push(...wiretapChannels);
       }
+      if (hasKind) {
+        const noParentChecks: string[] = [];
+        if (hasParentId) noParentChecks.push("COALESCE(c.parent_id, '') = ''");
+        if (hasThreadParentId) noParentChecks.push("COALESCE(c.thread_parent_id, '') = ''");
+        const unparentedExpr =
+          noParentChecks.length > 0
+            ? `(c.kind LIKE 'thread_%' AND ${noParentChecks.join(" AND ")})`
+            : "c.kind LIKE 'thread_%'";
+        channelClauses.push(unparentedExpr);
+      }
       conditions.push(`(${channelClauses.join(" OR ")})`);
     }
 
@@ -332,6 +344,7 @@ function readWiretapDatabaseRows(
         m.guild_id AS guild_id,
         m.channel_id AS channel_id,
         ${hasChannelName ? "COALESCE(c.name, m.channel_id)" : "m.channel_id"} AS channel_name,
+        ${hasKind ? "COALESCE(c.kind, '')" : "''"} AS channel_kind,
         ${joinParent && hasChannelName ? "COALESCE(pc.name, c.name, m.channel_id)" : hasChannelName ? "COALESCE(c.name, m.channel_id)" : "m.channel_id"} AS parent_channel_name,
         ${hasParentId ? "COALESCE(c.parent_id, '')" : "''"} AS parent_id,
         ${hasThreadParentId ? "COALESCE(c.thread_parent_id, '')" : "''"} AS thread_parent_id,
@@ -360,18 +373,34 @@ function readWiretapDatabaseRows(
             ? parentId
             : rawChannelId;
       const msgId = typeof row.message_id === "string" ? row.message_id.trim() : "";
-      const rawName =
-        effectiveChannelId !== rawChannelId
-          ? String(row.parent_channel_name ?? row.channel_name ?? effectiveChannelId)
-          : String(row.channel_name ?? effectiveChannelId);
+      const channelKind =
+        typeof row.channel_kind === "string" ? row.channel_kind.trim().toLowerCase() : "";
+      const isUnparentedThread =
+        channelKind.startsWith("thread_") &&
+        !threadParentId &&
+        !parentId &&
+        wiretapChannels.length > 0 &&
+        !channelSet.has(rawChannelId);
+      const rawChannelLabel = String(row.channel_name ?? "").trim();
+      const rawBody = String(row.content ?? "");
+      const mergedContent =
+        isUnparentedThread && rawChannelLabel && !rawBody.includes(rawChannelLabel)
+          ? `${rawChannelLabel}. ${rawBody}`
+          : rawBody;
+      const finalChannelName = isUnparentedThread
+        ? "forum-threads"
+        : (effectiveChannelId !== rawChannelId
+            ? String(row.parent_channel_name ?? row.channel_name ?? effectiveChannelId)
+            : String(row.channel_name ?? effectiveChannelId)
+          ).trim() || effectiveChannelId;
       return {
         messageId: msgId || undefined,
         guildId: String(row.guild_id ?? "").trim(),
         channelId: effectiveChannelId,
-        channelName: rawName.trim() || effectiveChannelId,
+        channelName: finalChannelName,
         authorId: typeof row.author_id === "string" ? row.author_id : undefined,
         authorName: String(row.author_name ?? "unknown"),
-        content: String(row.content ?? ""),
+        content: mergedContent,
         attachmentUrls: [],
         createdAt: String(row.created_at || new Date().toISOString()),
         sourceTier: "desktop_wiretap",
@@ -1057,7 +1086,9 @@ export async function exportDemoPack(opts: DemoPackOptions = {}): Promise<DemoIn
       }
       if (demandSources.length > 0) {
         return demandSources.some(
-          (src) => src.guildId === msg.guildId && src.channelId === msg.channelId
+          (src) =>
+            src.guildId === msg.guildId &&
+            (src.channelId === msg.channelId || msg.channelName === "forum-threads")
         );
       }
       return true;
